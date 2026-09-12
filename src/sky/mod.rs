@@ -69,6 +69,7 @@ const FLAG_GALAXY: u32 = 2;
 const FLAG_MOON: u32 = 4;
 const FLAG_CLOUDS: u32 = 8;
 const FLAG_ADAPTIVE_MARCH: u32 = 16;
+const FLAG_METEORS: u32 = 32;
 
 /// Procedural star field settings.
 #[derive(Resource, Debug, Clone, Reflect)]
@@ -105,9 +106,9 @@ impl Default for StarConfig {
         Self {
             enabled: true,
             density: 180.0,
-            brightness: 4.0,
-            occupancy: 0.30,
-            size: 0.07,
+            brightness: 4.4,
+            occupancy: 0.19,
+            size: 0.052,
             color_variation: 0.6,
             magnitude_falloff: 2.2,
             twinkle_speed: 2.4,
@@ -159,6 +160,51 @@ impl Default for GalaxyConfig {
             pole: Vec3::new(-0.874, -0.484, 0.460),
             // Sagittarius A*, roughly RA 17h46m / dec -29.0 degrees.
             center: Vec3::new(-0.055, -0.873, -0.484),
+        }
+    }
+}
+
+/// Shooting stars.
+///
+/// Meteors are drawn straight from the clock, with nothing simulated and
+/// nothing stored: the slot number and the tick number are hashed into an entry
+/// point, a heading and a brightness. Two cameras watching the same sky at the
+/// same instant therefore see the same meteor in the same place, and rewinding
+/// the clock replays the same shower.
+#[derive(Resource, Debug, Clone, Reflect)]
+#[reflect(Resource, Default)]
+pub struct MeteorConfig {
+    /// Draw meteors at all.
+    pub enabled: bool,
+
+    /// Meteors per minute across the whole sky.
+    ///
+    /// A dark-sky site on an ordinary night gives you five or ten an hour, so
+    /// the honest value is about `0.1`. The default is a good deal more
+    /// generous than that, on the grounds that a player who never sees one may
+    /// as well not have them; raise it into the tens for a meteor storm.
+    pub rate: f32,
+
+    /// How far a meteor travels across the sky, in radians.
+    ///
+    /// Individual meteors vary either side of this, with the long ones rare.
+    pub arc_length: f32,
+
+    /// Angular half-width of the trail, in radians.
+    pub width: f32,
+
+    /// Overall brightness multiplier.
+    pub brightness: f32,
+}
+
+impl Default for MeteorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            rate: 1.2,
+            arc_length: 0.35,
+            width: 0.0024,
+            brightness: 7.0,
         }
     }
 }
@@ -226,7 +272,7 @@ impl Default for MoonConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            brightness: 3.2,
+            brightness: 4.6,
             angular_radius: 0.0105,
             earthshine: 0.12,
             surface_detail: 0.7,
@@ -273,6 +319,9 @@ pub struct SkyUniform {
     pub moon_params: Vec4,
     /// Linear tint of the moon's surface.
     pub moon_tint: Vec4,
+    /// `x`: meteors per minute. `y`: trail arc length. `z`: trail width.
+    /// `w`: brightness.
+    pub meteor_params: Vec4,
     /// `x`: coverage. `y`: density. `z`: base altitude. `w`: thickness.
     pub cloud_params0: Vec4,
     /// `x`: shape scale. `y`: detail scale. `z`: detail strength. `w`: extinction.
@@ -316,6 +365,7 @@ impl Default for SkyUniform {
             galaxy_center: Vec4::new(0.0, 0.0, 1.0, 0.0),
             moon_params: Vec4::ZERO,
             moon_tint: Vec4::ONE,
+            meteor_params: Vec4::ZERO,
             cloud_params0: Vec4::ZERO,
             cloud_params1: Vec4::new(14_000.0, 1_400.0, 0.35, 0.045),
             cloud_params2: Vec4::new(0.8, -0.25, 0.6, 0.35),
@@ -572,10 +622,12 @@ impl Plugin for SkyPlugin {
         app.init_resource::<StarConfig>()
             .init_resource::<GalaxyConfig>()
             .init_resource::<MoonConfig>()
+            .init_resource::<MeteorConfig>()
             .init_resource::<CloudConfig>()
             .register_type::<StarConfig>()
             .register_type::<GalaxyConfig>()
             .register_type::<MoonConfig>()
+            .register_type::<MeteorConfig>()
             .register_type::<CloudConfig>()
             .register_type::<SkyDome>()
             .add_plugins((
@@ -613,42 +665,49 @@ fn spawn_sky(
     ));
 }
 
+/// Everything the sky's appearance is a function of.
+///
+/// Grouped only because a Bevy system takes at most sixteen parameters and the
+/// sky needs more than that; the list is otherwise exactly what
+/// [`build_uniform`] reads.
+#[derive(bevy::ecs::system::SystemParam)]
+pub struct SkyInputs<'w> {
+    config: Res<'w, WeatherConfig>,
+    stars: Res<'w, StarConfig>,
+    galaxy: Res<'w, GalaxyConfig>,
+    moon: Res<'w, MoonConfig>,
+    meteors: Res<'w, MeteorConfig>,
+    clouds: Res<'w, CloudConfig>,
+    fog: Res<'w, FogConfig>,
+    weather: Res<'w, Weather>,
+    bodies: Res<'w, CelestialBodies>,
+    weather_time: Res<'w, WeatherTime>,
+    wind: Res<'w, Wind>,
+    lightning: Res<'w, LightningState>,
+}
+
 /// How often the sky material's uniform is rebuilt: every frame.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the sky is a function of every weather resource; grouping them \
-              into a SystemParam would hide that rather than simplify it"
-)]
 fn update_sky(
     mut sky_materials: ResMut<Assets<SkyMaterial>>,
     mut cloud_materials: ResMut<Assets<CloudMaterial>>,
     space_domes: Query<&MeshMaterial3d<SkyMaterial>, bevy::ecs::query::With<SkyDome>>,
     cloud_domes: Query<&MeshMaterial3d<CloudMaterial>, bevy::ecs::query::With<SkyDome>>,
-    config: Res<WeatherConfig>,
-    stars: Res<StarConfig>,
-    galaxy: Res<GalaxyConfig>,
-    moon: Res<MoonConfig>,
-    clouds: Res<CloudConfig>,
-    fog: Res<FogConfig>,
-    weather: Res<Weather>,
-    bodies: Res<CelestialBodies>,
-    weather_time: Res<WeatherTime>,
-    wind: Res<Wind>,
-    lightning: Res<LightningState>,
+    sky: SkyInputs,
     time: Res<Time>,
 ) {
     let uniform = build_uniform(
-        &config,
-        &stars,
-        &galaxy,
-        &moon,
-        &clouds,
-        &fog,
-        &weather,
-        &bodies,
-        &weather_time,
-        &wind,
-        &lightning,
+        &sky.config,
+        &sky.stars,
+        &sky.galaxy,
+        &sky.moon,
+        &sky.meteors,
+        &sky.clouds,
+        &sky.fog,
+        &sky.weather,
+        &sky.bodies,
+        &sky.weather_time,
+        &sky.wind,
+        &sky.lightning,
         time.elapsed_secs_wrapped(),
     );
 
@@ -676,6 +735,7 @@ pub fn build_uniform(
     stars: &StarConfig,
     galaxy: &GalaxyConfig,
     moon: &MoonConfig,
+    meteors: &MeteorConfig,
     clouds: &CloudConfig,
     fog: &FogConfig,
     weather: &Weather,
@@ -697,6 +757,9 @@ pub fn build_uniform(
         }
         if moon.enabled {
             flags |= FLAG_MOON;
+        }
+        if meteors.enabled && meteors.rate > 0.0 {
+            flags |= FLAG_METEORS;
         }
         if clouds_enabled(config, &conditions) {
             flags |= FLAG_CLOUDS;
@@ -760,6 +823,13 @@ pub fn build_uniform(
         ),
         moon_tint: moon_tint.extend(1.0),
 
+        meteor_params: Vec4::new(
+            meteors.rate.max(0.0),
+            meteors.arc_length.max(1e-3),
+            meteors.width.max(1e-4),
+            meteors.brightness.max(0.0) * NIGHT_SCALE,
+        ),
+
         cloud_params0: Vec4::new(
             conditions.cloud_coverage,
             conditions.cloud_density,
@@ -804,7 +874,7 @@ pub fn build_uniform(
             .to_vec3()
             .extend(1.0),
         fog_params: Vec4::new(
-            fog.extinction_at(conditions.fog),
+            fog.sky_extinction_at(conditions.fog),
             fog.volume_height.max(0.1),
             fog.sun_glow.max(0.0),
             fog.sun_glow_exponent.max(1.0),
@@ -1091,6 +1161,7 @@ mod tests {
             &StarConfig::default(),
             &GalaxyConfig::default(),
             &MoonConfig::default(),
+            &MeteorConfig::default(),
             &CloudConfig::default(),
             &FogConfig::default(),
             &weather,

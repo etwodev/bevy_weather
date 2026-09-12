@@ -27,6 +27,22 @@
 //!   own looks perfectly reasonable.
 //! * `NO_FAST=1` disables `CloudConfig::adaptive_marching`, so the fast path
 //!   can be checked against the slow one for both looks and stability.
+//! * `SWEEP=clear|cloudy|overcast` replaces the shot list with the sun walking
+//!   down through sunset and on into the night, framed where it went down.
+//!   Anything still glowing there after astronomical twilight is light that
+//!   should not be arriving.
+//! * `SHADOWS=1` shoots the ground from height, which is the only way to see a
+//!   cloud shadow: they are kilometres across. `SHADOWTILE=<m>` shrinks the
+//!   pattern and `NO_CLOUD_SHADOWS=1` turns it off for an A/B.
+//! * `GODRAYS=1` stands in the fog looking into a low sun, which is the framing
+//!   where a shadow-cascade boundary shows up. `BEVY_CASCADES=1` puts Bevy's
+//!   stock 10/150 layout back, for comparison.
+//! * `METEORS=<per minute>` turns the meteor rate up. At the default rate a run
+//!   will never catch one.
+//! * `TINT=<0..1>` overrides `SunConfig::light_tint`, `HAZE=<n>` overrides
+//!   `AtmosphereConfig::aerosol_density`, and `EV=<n>` / `TONEMAP=tony|aces|agx|
+//!   blender|reinhard` override the exposure and tonemapper -- the four knobs
+//!   that decide what a sunset looks like.
 
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::RenderTarget;
@@ -48,6 +64,15 @@ enum Aim {
     Sun,
     /// Straight at the moon.
     Moon,
+    /// At the sun's compass bearing, but held at a fixed pitch, so the shot
+    /// still frames the horizon once the sun has set.
+    SunBearing { pitch: f32 },
+    /// From high up, looking down, to see what is happening on the ground.
+    Aerial { yaw: f32, pitch: f32, height: f32 },
+    /// Standing on the far side of the scene from the sun, at eye height,
+    /// looking into it -- so the pillars are between the camera and the light
+    /// and throw shafts through whatever is in the air.
+    IntoSun { pitch: f32, back: f32 },
 }
 
 /// One capture.
@@ -97,8 +122,111 @@ fn shots() -> Vec<Shot> {
             .collect();
     }
 
+    if std::env::var("GODRAYS").is_ok() {
+        // Low sun through fog, at eye level, looking almost into it: the one
+        // framing where a shadow-cascade boundary shows up as a line ruled
+        // across the light shafts.
+        return vec![
+            Shot {
+                name: "godrays-misty",
+                hour: 17.6,
+                preset: WeatherPreset::MistyMorning,
+                aim: Aim::IntoSun {
+                    pitch: 2.0,
+                    back: 38.0,
+                },
+                phase: None,
+            },
+            Shot {
+                name: "godrays-fog",
+                hour: 17.6,
+                preset: WeatherPreset::Fog,
+                aim: Aim::IntoSun {
+                    pitch: 2.0,
+                    back: 38.0,
+                },
+                phase: None,
+            },
+        ];
+    }
+
+    if std::env::var("SHADOWS").is_ok() {
+        // Looking down from height, because a cloud shadow is kilometres across
+        // and there is no seeing one from the ground in a small scene.
+        return vec![
+            Shot {
+                name: "shadow-noon",
+                hour: 12.0,
+                preset: WeatherPreset::PartlyCloudy,
+                aim: Aim::Aerial {
+                    yaw: 0.35,
+                    pitch: -38.0,
+                    height: 700.0,
+                },
+                phase: None,
+            },
+            Shot {
+                name: "shadow-afternoon",
+                hour: 16.0,
+                preset: WeatherPreset::FewClouds,
+                aim: Aim::Aerial {
+                    yaw: 0.35,
+                    pitch: -30.0,
+                    height: 700.0,
+                },
+                phase: None,
+            },
+            Shot {
+                name: "shadow-clear",
+                hour: 12.0,
+                preset: WeatherPreset::Clear,
+                aim: Aim::Aerial {
+                    yaw: 0.35,
+                    pitch: -38.0,
+                    height: 700.0,
+                },
+                phase: None,
+            },
+        ];
+    }
+
+    if let Ok(preset) = std::env::var("SWEEP") {
+        // Walk the sun down through sunset and on into the night, framing the
+        // horizon where it went down. Anything still glowing there after
+        // astronomical twilight is light that should not be arriving.
+        let preset = match preset.as_str() {
+            "cloudy" => WeatherPreset::PartlyCloudy,
+            "overcast" => WeatherPreset::Overcast,
+            _ => WeatherPreset::Clear,
+        };
+        return [
+            17.0, 18.0, 18.8, 19.4, 19.8, 20.2, 20.6, 21.0, 21.5, 22.0, 23.0, 0.5,
+        ]
+        .iter()
+        .map(|&hour| Shot {
+            name: Box::leak(
+                format!("sweep-{:05.2}", hour)
+                    .replace('.', "h")
+                    .into_boxed_str(),
+            ),
+            hour,
+            preset,
+            aim: Aim::SunBearing { pitch: 12.0 },
+            phase: None,
+        })
+        .collect();
+    }
+
     vec![
-        shot("01-dawn-clear", 6.2, WeatherPreset::Clear, fixed(0.35, 6.0)),
+        // The clock is set to the northern summer solstice at 45 degrees, so
+        // the sun is up by half past four; 6.2 was mid-morning, not dawn.
+        Shot {
+            name: "01-dawn-clear",
+            hour: 4.6,
+            preset: WeatherPreset::Clear,
+            aim: Aim::SunBearing { pitch: 10.0 },
+            phase: None,
+        },
         shot(
             "02-noon-cumulus",
             12.0,
@@ -293,7 +421,11 @@ struct CaptureCamera;
 fn setup(
     mut commands: Commands,
     mut moon: ResMut<MoonConfig>,
+    mut sun: ResMut<bevy_weather::celestial::SunConfig>,
+    mut atmosphere: ResMut<bevy_weather::atmosphere::AtmosphereConfig>,
     mut stars: ResMut<StarConfig>,
+    mut meteors: ResMut<MeteorConfig>,
+    mut cloud_shadows: ResMut<CloudShadowConfig>,
     mut galaxy: ResMut<GalaxyConfig>,
     mut clouds: ResMut<bevy_weather::clouds::CloudConfig>,
     mut config: ResMut<WeatherConfig>,
@@ -305,6 +437,41 @@ fn setup(
     // Blow the moon up so its phase, terminator and maria can be inspected.
     if std::env::var("BIG_MOON").is_ok() {
         moon.angular_radius = 0.12;
+    }
+    if std::env::var("BEVY_CASCADES").is_ok() {
+        // Bevy's stock cascade layout, for comparison.
+        sun.shadow_near_distance = 10.0;
+        sun.shadow_distance = 150.0;
+        sun.shadow_cascade_overlap = 0.2;
+    }
+    if let Ok(v) = std::env::var("SHADOWTILE") {
+        cloud_shadows.tile_size = v.parse().unwrap_or(4_000.0);
+    }
+    if std::env::var("NO_CLOUD_SHADOWS").is_ok() {
+        cloud_shadows.enabled = false;
+    }
+    if let Ok(v) = std::env::var("METEORS") {
+        // Meteors are rare by design, so a normal run will never catch one.
+        // This turns the sky into a storm so the streaks can be looked at.
+        meteors.rate = v.parse().unwrap_or(600.0);
+    }
+    if let Ok(v) = std::env::var("HAZE") {
+        atmosphere.aerosol_density = v.parse().unwrap_or(2.0);
+    }
+    if let Ok(v) = std::env::var("TONEMAP") {
+        atmosphere.tonemapping = Some(match v.as_str() {
+            "aces" => bevy::core_pipeline::tonemapping::Tonemapping::AcesFitted,
+            "agx" => bevy::core_pipeline::tonemapping::Tonemapping::AgX,
+            "blender" => bevy::core_pipeline::tonemapping::Tonemapping::BlenderFilmic,
+            "reinhard" => bevy::core_pipeline::tonemapping::Tonemapping::ReinhardLuminance,
+            _ => bevy::core_pipeline::tonemapping::Tonemapping::TonyMcMapface,
+        });
+    }
+    if let Ok(v) = std::env::var("EV") {
+        atmosphere.exposure_ev100 = Some(v.parse().unwrap_or(13.0));
+    }
+    if let Ok(v) = std::env::var("TINT") {
+        sun.light_tint = v.parse().unwrap_or(0.35);
     }
     if let Ok(v) = std::env::var("WB") {
         moon.white_balance = v.parse().unwrap_or(1.0);
@@ -361,7 +528,7 @@ fn setup(
     ));
 
     commands.spawn((
-        Mesh3d(meshes.add(Plane3d::new(Vec3::Y, Vec2::splat(800.0)))),
+        Mesh3d(meshes.add(Plane3d::new(Vec3::Y, Vec2::splat(3_000.0)))),
         MeshMaterial3d(materials.add(StandardMaterial {
             base_color: Color::srgb(0.15, 0.18, 0.12),
             perceptual_roughness: 0.95,
@@ -453,6 +620,36 @@ fn run_capture(
                 Aim::Sun => Transform::from_translation(eye).looking_to(sky.sun_direction, Vec3::Y),
                 Aim::Moon => {
                     Transform::from_translation(eye).looking_to(sky.moon_direction, Vec3::Y)
+                }
+                Aim::Aerial { yaw, pitch, height } => {
+                    Transform::from_translation(Vec3::new(0.0, height, 40.0)).with_rotation(
+                        Quat::from_euler(EulerRot::YXZ, yaw, pitch.to_radians(), 0.0),
+                    )
+                }
+                Aim::IntoSun { pitch, back } => {
+                    let bearing = Vec3::new(sky.sun_direction.x, 0.0, sky.sun_direction.z)
+                        .normalize_or(Vec3::NEG_Z);
+                    let yaw = (-bearing.x).atan2(-bearing.z);
+                    Transform::from_translation(-bearing * back + Vec3::new(0.0, 1.7, 0.0))
+                        .with_rotation(Quat::from_euler(
+                            EulerRot::YXZ,
+                            yaw,
+                            pitch.to_radians(),
+                            0.0,
+                        ))
+                }
+                Aim::SunBearing { pitch } => {
+                    let bearing = Vec3::new(sky.sun_direction.x, 0.0, sky.sun_direction.z)
+                        .normalize_or(Vec3::NEG_Z);
+                    // A camera looks along its local -Z, so the yaw that aims
+                    // it at `bearing` solves (-sin y, -cos y) = bearing.xz.
+                    let yaw = (-bearing.x).atan2(-bearing.z);
+                    Transform::from_translation(eye).with_rotation(Quat::from_euler(
+                        EulerRot::YXZ,
+                        yaw,
+                        pitch.to_radians(),
+                        0.0,
+                    ))
                 }
             };
         }

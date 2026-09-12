@@ -11,7 +11,7 @@ use bevy::app::App;
 use bevy::time::{Time, TimePlugin, TimeUpdateStrategy};
 use std::time::Duration;
 
-use bevy::light::{DirectionalLight, SunDisk};
+use bevy::light::{CascadeShadowConfig, DirectionalLight, SunDisk};
 use bevy_weather::prelude::*;
 use bevy_weather::{
     CorePlugin, celestial::CelestialBodies, celestial::CelestialPlugin,
@@ -314,4 +314,116 @@ fn the_sun_light_does_draw_a_disc() {
     let disc = discs[0].expect("the sun light should carry a SunDisk");
     assert!(disc.intensity > 0.0);
     assert!(disc.angular_size > 0.0);
+}
+
+#[test]
+fn the_sun_casts_shadows_well_past_the_default_distance() {
+    // Bevy's default cascade layout stops shadows at 150 units and puts its
+    // first cascade boundary ten units from the camera. That boundary is
+    // visible: the volumetric fog pass picks one cascade per sample with no
+    // blending between them, so a god ray changes character across a line ruled
+    // at exactly that distance -- a line that follows the player around.
+    let mut app = simulation_app();
+    app.add_plugins(CelestialPlugin);
+    app.update();
+    app.update();
+
+    let mut suns = app
+        .world_mut()
+        .query_filtered::<&CascadeShadowConfig, bevy::ecs::query::With<SunLight>>();
+    let configs: Vec<_> = suns.iter(app.world()).collect();
+    assert_eq!(configs.len(), 1, "expected exactly one sun light");
+    let cascades = configs[0];
+
+    let first = cascades.bounds.first().copied().unwrap_or(0.0);
+    let last = cascades.bounds.last().copied().unwrap_or(0.0);
+    assert!(
+        first >= 25.0,
+        "the first cascade boundary is still close enough to be stared at: {first}"
+    );
+    assert!(
+        last >= 500.0,
+        "shadows stop {last} units out, which is inside anything with a horizon"
+    );
+}
+
+#[test]
+fn the_atmosphere_is_handed_unfiltered_sunlight() {
+    // The sky's colour is Bevy's atmosphere to compute: it integrates the
+    // transmittance from the sun to every point along the view ray, and that
+    // integral is what reddens a sunset. Handing it a light that has *already*
+    // been reddened applies the extinction twice, and because Rayleigh
+    // scattering is six times stronger in blue than in red, scattering an
+    // orange sun leaves a muddy olive sky rather than an orange one.
+    //
+    // So the light stays much closer to white than the ground-level sun colour
+    // this plugin's own shaders use.
+    let mut app = simulation_app();
+    app.add_plugins(CelestialPlugin);
+    // Dusk, where the two differ most.
+    app.world_mut().resource_mut::<WeatherTime>().set_hour(19.6);
+    app.update();
+    app.update();
+
+    let ground = app.world().resource::<CelestialBodies>().sun_color;
+
+    let mut suns = app
+        .world_mut()
+        .query_filtered::<&DirectionalLight, bevy::ecs::query::With<SunLight>>();
+    let lights: Vec<_> = suns.iter(app.world()).collect();
+    let light = lights[0].color.to_linear();
+
+    let warmth = |c: bevy::color::LinearRgba| c.red / c.blue.max(1e-6);
+    assert!(
+        warmth(ground) > 1.5,
+        "the ground-level sun should be strongly reddened at dusk: {ground:?}"
+    );
+    assert!(
+        warmth(light) < warmth(ground) * 0.75,
+        "the light is nearly as reddened as the ground colour, so the \
+         atmosphere will redden it a second time: {light:?} against {ground:?}"
+    );
+}
+
+#[test]
+fn twilight_gets_an_exposure_lift_and_daylight_does_not() {
+    // Twilight is orders of magnitude dimmer than noon and an eye sitting in it
+    // opens up to match. The night sky is separately exaggerated so that stars
+    // read at a daylight exposure, so the lift is only wanted in the gap
+    // between the two.
+    let atmosphere = AtmosphereConfig::default();
+    assert_eq!(atmosphere.exposure_lift(1.0), 0.0, "noon needs no lift");
+    assert_eq!(
+        atmosphere.exposure_lift(-0.6),
+        0.0,
+        "a properly dark sky needs no lift"
+    );
+    let dusk = atmosphere.exposure_lift(-0.03);
+    assert!(dusk > 0.5, "twilight was not lifted at all: {dusk}");
+    assert!(dusk <= atmosphere.twilight_exposure_lift + 1e-4);
+}
+
+#[test]
+fn cloud_shadows_follow_the_clouds_rather_than_the_ground() {
+    // The shadow map is generated with no wind baked in; the deck's
+    // displacement is carried by translating the light, which is free and
+    // continuous between rebuilds. Bake it in as well and the shadows move at
+    // twice the speed of the clouds casting them.
+    use bevy::math::Vec2;
+    use bevy_weather::cloud_field::CloudField;
+    use bevy_weather::clouds::CloudConfig;
+
+    let conditions = WeatherPreset::PartlyCloudy.conditions();
+    let clouds = CloudConfig::default();
+    let still = CloudField::new(&conditions, &clouds, Vec2::ZERO, 0.0);
+    let blown = CloudField::new(&conditions, &clouds, Vec2::new(400.0, 0.0), 0.0);
+    let shift = 400.0 * clouds.wind_multiplier;
+
+    let a: f32 = (0..40)
+        .map(|i| still.column_density(i as f32 * 130.0, 0.0))
+        .sum();
+    let b: f32 = (0..40)
+        .map(|i| blown.column_density(i as f32 * 130.0 - shift, 0.0))
+        .sum();
+    assert!((a - b).abs() < 1e-2, "{a} vs {b}");
 }

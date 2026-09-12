@@ -13,7 +13,7 @@ use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::IntoScheduleConfigs;
 use bevy::ecs::system::{Commands, Query, Res, ResMut};
 use bevy::ecs::world::Ref;
-use bevy::light::atmosphere::ScatteringMedium;
+use bevy::light::atmosphere::{Falloff, PhaseFunction, ScatteringMedium, ScatteringTerm};
 use bevy::light::{Atmosphere, AtmosphereEnvironmentMapLight};
 use bevy::pbr::{AtmosphereMode, AtmosphereSettings};
 use bevy::post_process::bloom::Bloom;
@@ -77,6 +77,21 @@ pub struct AtmosphereConfig {
     /// camera renders it blown out. `None` leaves exposure alone.
     pub exposure_ev100: Option<f32>,
 
+    /// Stops of extra exposure to give the sky around sunrise and sunset.
+    ///
+    /// This stands in for an adaptation the renderer cannot perform. Twilight
+    /// is two or three orders of magnitude dimmer than noon, and an eye that
+    /// has been sitting in it for a few minutes opens up to match -- which is
+    /// why the afterglow looks like something, rather than like the near-black
+    /// a fixed daylight exposure records.
+    ///
+    /// The night sky is already exaggerated on its own account so that stars
+    /// stay legible, so the lift is only needed in the gap between the two: it
+    /// rises as the sun goes down, peaks around the horizon, and is gone again
+    /// by the time it is properly dark. `0.0` disables it and gives you the
+    /// unadjusted physics.
+    pub twilight_exposure_lift: f32,
+
     /// Set [`Tonemapping`] on weather cameras. `None` leaves it alone.
     pub tonemapping: Option<Tonemapping>,
 
@@ -93,6 +108,21 @@ pub struct AtmosphereConfig {
 
     /// Farthest distance, in metres, at which aerial perspective is evaluated.
     pub aerial_view_max_distance: f32,
+
+    /// Density of the aerosol (Mie) layer, relative to clean air.
+    ///
+    /// This is the haze knob, and it is what decides how dramatic sunrise and
+    /// sunset are. Aerosols sit in the lowest kilometre or two and scatter
+    /// strongly *forward* with almost no colour preference, so at a low sun --
+    /// when the light is arriving along the ground, through the whole depth of
+    /// that layer -- they take the reddened beam and spread it across a wide
+    /// arc of sky. That is the difference between a thin orange line on the
+    /// horizon and half the sky going gold.
+    ///
+    /// `1.0` is a clear day. Two or three is a hazy one, and gives the
+    /// postcard sunset; below one the air is alpine-thin and the sun goes down
+    /// with barely any colour at all.
+    pub aerosol_density: f32,
 }
 
 impl Default for AtmosphereConfig {
@@ -105,6 +135,7 @@ impl Default for AtmosphereConfig {
             environment_light: true,
             environment_map_size: None,
             exposure_ev100: Some(13.0),
+            twilight_exposure_lift: 1.6,
             tonemapping: Some(Tonemapping::AcesFitted),
             bloom: Some(Bloom {
                 // A little above `NATURAL`. The sun is the one thing in the
@@ -114,6 +145,7 @@ impl Default for AtmosphereConfig {
                 ..Bloom::NATURAL
             }),
             aerial_view_max_distance: 32_000.0,
+            aerosol_density: 2.0,
         }
     }
 }
@@ -124,6 +156,85 @@ impl AtmosphereConfig {
     pub fn quality(&self, global: Quality) -> Quality {
         self.quality.unwrap_or(global)
     }
+
+    /// Stops of exposure lift for a given solar altitude (its sine).
+    ///
+    /// Zero in daylight, zero once it is properly dark, and
+    /// [`twilight_exposure_lift`](Self::twilight_exposure_lift) in between.
+    pub fn exposure_lift(&self, sun_altitude: f32) -> f32 {
+        let lift = self.twilight_exposure_lift;
+        if lift <= 0.0 {
+            return 0.0;
+        }
+        // Fading in as the sun drops toward the horizon, and back out as the
+        // sky reaches the darkness the exaggerated night is calibrated for.
+        // The two edges are civil and astronomical twilight.
+        let arriving = 1.0 - crate::math::remap01(sun_altitude, 0.0, 0.17);
+        let leaving = crate::math::remap01(sun_altitude, -0.31, -0.12);
+        lift * arriving * leaving
+    }
+
+    /// Builds the scattering medium this configuration describes.
+    pub fn medium(&self) -> ScatteringMedium {
+        earth_medium(self.aerosol_density.max(0.0))
+            .with_density_multiplier(self.density_multiplier.max(0.0))
+    }
+}
+
+/// An Earth atmosphere, with the aerosol layer scaled by `aerosol`.
+///
+/// Written out here rather than taken from [`ScatteringMedium::earth`] for two
+/// reasons. The first is that the haze has to be scalable on its own:
+/// `with_density_multiplier` scales every term together, which thickens the
+/// molecular air along with the aerosols and turns the daytime sky milky
+/// instead of making the sunset richer.
+///
+/// The second is that Bevy's built-in earth medium has the Mie term's
+/// scattering and absorption the wrong way round. Bruneton's coefficients --
+/// which every one of the other numbers here is taken from -- are
+/// `3.996e-6` scattering against `4.44e-6` extinction, so absorption is the
+/// small remainder, `0.444e-6`. Bevy reverses them, leaving an aerosol layer
+/// that absorbs nine times more light than it scatters.
+///
+/// The visible consequence is exactly the thing this exists to fix. Aerosols
+/// are what spread a low sun's light across the sky; a layer that swallows that
+/// light instead gives a sunset which is dim, grey and confined to a thin band
+/// at the horizon, with the sky above it going a muddy olive. Restoring the
+/// ratio is most of what makes a sunset look like one.
+fn earth_medium(aerosol: f32) -> ScatteringMedium {
+    ScatteringMedium::new(
+        256,
+        256,
+        [
+            // Rayleigh: the molecular air that makes the sky blue.
+            ScatteringTerm {
+                absorption: bevy::math::Vec3::ZERO,
+                scattering: bevy::math::Vec3::new(5.802e-6, 13.558e-6, 33.100e-6),
+                falloff: Falloff::Exponential { scale: 8.0 / 60.0 },
+                phase: PhaseFunction::Rayleigh,
+            },
+            // Mie: haze, dust and water droplets in the lowest kilometre or so.
+            ScatteringTerm {
+                absorption: bevy::math::Vec3::splat(0.444e-6 * aerosol),
+                scattering: bevy::math::Vec3::splat(3.996e-6 * aerosol),
+                falloff: Falloff::Exponential { scale: 1.2 / 60.0 },
+                phase: PhaseFunction::Mie { asymmetry: 0.8 },
+            },
+            // Ozone: absorbs in the middle of the spectrum, which is what keeps
+            // a twilight sky blue after the sun has gone rather than letting it
+            // slide through grey.
+            ScatteringTerm {
+                absorption: bevy::math::Vec3::new(0.650e-6, 1.881e-6, 0.085e-6),
+                scattering: bevy::math::Vec3::ZERO,
+                falloff: Falloff::Tent {
+                    center: 0.75,
+                    width: 0.3,
+                },
+                phase: PhaseFunction::Isotropic,
+            },
+        ],
+    )
+    .with_label("bevy_weather_earth")
 }
 
 /// Marks the planet entity this plugin spawned, so it can be found again.
@@ -143,7 +254,7 @@ impl Plugin for WeatherAtmospherePlugin {
             .add_systems(Startup, spawn_planet)
             .add_systems(
                 Update,
-                (sync_planet, configure_cameras).in_set(WeatherSystems::Apply),
+                (sync_planet, configure_cameras, drive_exposure).in_set(WeatherSystems::Apply),
             );
     }
 }
@@ -157,10 +268,7 @@ fn spawn_planet(
     if !config.atmosphere || !atmosphere.spawn_planet {
         return;
     }
-    let medium = media.add(
-        ScatteringMedium::earth(256, 256)
-            .with_density_multiplier(atmosphere.density_multiplier.max(0.0)),
-    );
+    let medium = media.add(atmosphere.medium());
     let mut planet = Atmosphere::earth(medium);
     // `units_per_meter` lets a scene authored in centimetres (or kilometres)
     // still get a correctly-scaled sky.
@@ -180,11 +288,34 @@ fn sync_planet(
         return;
     }
     for planet in &planets {
-        let rebuilt = ScatteringMedium::earth(256, 256)
-            .with_density_multiplier(atmosphere.density_multiplier.max(0.0));
+        let rebuilt = atmosphere.medium();
         if let Some(mut slot) = media.get_mut(&planet.medium) {
             *slot = rebuilt;
         }
+    }
+}
+
+/// Keeps camera exposure tracking the sun.
+///
+/// Separate from [`configure_cameras`] because that only rewrites on change,
+/// and this has to follow the clock.
+fn drive_exposure(
+    mut commands: Commands,
+    config: Res<WeatherConfig>,
+    atmosphere: Res<AtmosphereConfig>,
+    bodies: Res<crate::celestial::CelestialBodies>,
+    cameras: Query<Entity, With<WeatherCamera>>,
+) {
+    let Some(base) = atmosphere.exposure_ev100 else {
+        return;
+    };
+    if !config.atmosphere {
+        return;
+    }
+    // Lower EV100 is a longer exposure, so a lift subtracts.
+    let ev100 = base - atmosphere.exposure_lift(bodies.sun_altitude);
+    for entity in &cameras {
+        commands.entity(entity).insert(Exposure { ev100 });
     }
 }
 
@@ -239,9 +370,6 @@ fn configure_cameras(
             });
         } else {
             entity_commands.remove::<AtmosphereEnvironmentMapLight>();
-        }
-        if let Some(ev100) = atmosphere.exposure_ev100 {
-            entity_commands.insert(Exposure { ev100 });
         }
         if let Some(tonemapping) = atmosphere.tonemapping {
             entity_commands.insert(tonemapping);

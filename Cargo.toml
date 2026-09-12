@@ -30,6 +30,10 @@ bevy = { version = "0.19.1", default-features = false, features = [
     "bevy_post_process",
     "bevy_render",
     "bevy_shader",
+    # Light cookies, which is how cloud shadows reach the ground. Pulls in
+    # clustered decals; where the GPU cannot do those, the texture is simply
+    # never sampled and lighting carries on unshadowed.
+    "pbr_light_textures",
 ] }
 
 [dev-dependencies]

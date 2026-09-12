@@ -174,7 +174,7 @@ fn setup_scene(
 
     // Ground.
     commands.spawn((
-        Mesh3d(meshes.add(Plane3d::new(Vec3::Y, Vec2::splat(600.0)))),
+        Mesh3d(meshes.add(Plane3d::new(Vec3::Y, Vec2::splat(1_800.0)))),
         MeshMaterial3d(materials.add(StandardMaterial {
             base_color: Color::srgb(0.16, 0.19, 0.13),
             perceptual_roughness: 0.95,
@@ -314,6 +314,8 @@ fn weather_controls(
     mut procedural: ResMut<ProceduralWeather>,
     mut config: ResMut<WeatherConfig>,
     mut atmosphere: ResMut<AtmosphereConfig>,
+    mut cloud_shadows: ResMut<CloudShadowConfig>,
+    mut meteors: ResMut<MeteorConfig>,
     time: Res<Time>,
 ) {
     // ---- Clock -------------------------------------------------------------
@@ -403,6 +405,15 @@ fn weather_controls(
     if keys.just_pressed(KeyCode::Digit6) {
         atmosphere.raymarched = !atmosphere.raymarched;
     }
+    if keys.just_pressed(KeyCode::Digit7) {
+        cloud_shadows.enabled = !cloud_shadows.enabled;
+    }
+    if keys.just_pressed(KeyCode::Digit8) {
+        // Meteors are rare on purpose -- a couple a minute at the default rate,
+        // spread over the whole sky, which means you will probably never see
+        // one while reading a status panel. This turns the Perseids on.
+        meteors.rate = if meteors.rate > 10.0 { 1.2 } else { 90.0 };
+    }
 }
 
 fn report_lightning(mut strikes: MessageReader<LightningStrike>) {
@@ -428,6 +439,8 @@ fn update_ui(
     config: Res<WeatherConfig>,
     bodies: Res<CelestialBodies>,
     wind: Res<Wind>,
+    cloud_shadows: Res<CloudShadowConfig>,
+    meteors: Res<MeteorConfig>,
 ) {
     let Ok(mut text) = text.single_mut() else {
         return;
@@ -476,6 +489,7 @@ bevy_weather showcase   {frame:5.2} ms  ({fps:3.0} fps, {p95:5.2} ms p95)
 
   Toggles     [1] clouds {clouds}  [2] fog {vfog}  [3] precip {precip}
               [4] sky {sky}  [5] thunder {thunder_on}  [6] raymarched sky
+              [7] cloud shadows {cloud_shadows}  [8] meteor shower {shower}
 
   Move        WASD / Q E   (Shift to sprint)   Esc grabs the mouse
   Time        Space pause   [ ] slower/faster   <- -> scrub   Up/Down +/- a day
@@ -489,6 +503,8 @@ bevy_weather showcase   {frame:5.2} ms  ({fps:3.0} fps, {p95:5.2} ms p95)
             0.0
         },
         p95 = stats.p95(),
+        cloud_shadows = on_off(cloud_shadows.enabled),
+        shower = on_off(meteors.rate > 10.0),
         day = weather_time.day,
         h = hour as u32,
         m = ((hour - hour.floor()) * 60.0) as u32,
@@ -604,6 +620,7 @@ struct Knobs<'a> {
     atmosphere: &'a mut AtmosphereConfig,
     precipitation: &'a mut PrecipitationConfig,
     clouds: &'a mut CloudConfig,
+    cloud_shadows: &'a mut CloudShadowConfig,
     conditions: &'a mut Weather,
 }
 
@@ -621,34 +638,38 @@ struct Scenario {
 const SCENARIOS: &[Scenario] = &[
     Scenario {
         name: "scene only",
-        apply: |k| set(k, false, false, false, false, false, false),
+        apply: |k| set(k, false, false, false, false, false, false, false),
     },
     Scenario {
         name: "+ atmosphere",
-        apply: |k| set(k, true, false, false, false, false, false),
+        apply: |k| set(k, true, false, false, false, false, false, false),
     },
     Scenario {
         name: "+ sky lighting",
-        apply: |k| set(k, true, true, false, false, false, false),
+        apply: |k| set(k, true, true, false, false, false, false, false),
     },
     Scenario {
         name: "+ stars, galaxy, moon",
-        apply: |k| set(k, true, true, true, false, false, false),
+        apply: |k| set(k, true, true, true, false, false, false, false),
     },
     Scenario {
         name: "clouds, no fast path",
         apply: |k| {
-            set(k, true, true, true, true, false, false);
+            set(k, true, true, true, true, false, false, false);
             k.clouds.adaptive_marching = false;
         },
     },
     Scenario {
         name: "+ clouds",
-        apply: |k| set(k, true, true, true, true, false, false),
+        apply: |k| set(k, true, true, true, true, false, false, false),
+    },
+    Scenario {
+        name: "+ cloud shadows",
+        apply: |k| set(k, true, true, true, true, true, false, false),
     },
     Scenario {
         name: "+ rain and snow",
-        apply: |k| set(k, true, true, true, true, true, false),
+        apply: |k| set(k, true, true, true, true, true, true, false),
     },
     // Cloud cost is not one number. A clear sky skips the raymarch outright and
     // a solid deck extinguishes each ray almost immediately; the expensive case
@@ -673,13 +694,13 @@ const SCENARIOS: &[Scenario] = &[
     },
     Scenario {
         name: "+ fog",
-        apply: |k| set(k, true, true, true, true, true, true),
+        apply: |k| set(k, true, true, true, true, true, true, true),
     },
 ];
 
 /// Clouds at a fixed coverage, with everything else on.
 fn with_coverage(k: &mut Knobs, amount: f32) {
-    set(k, true, true, true, true, false, false);
+    set(k, true, true, true, true, true, false, false);
     let mut conditions = WeatherPreset::PartlyCloudy.conditions();
     conditions.cloud_coverage = amount;
     conditions.cloud_density = 0.7;
@@ -688,6 +709,7 @@ fn with_coverage(k: &mut Knobs, amount: f32) {
 
 #[expect(
     clippy::fn_params_excessive_bools,
+    clippy::too_many_arguments,
     reason = "a flag table, read by position"
 )]
 fn set(
@@ -696,6 +718,7 @@ fn set(
     sky_lighting: bool,
     sky: bool,
     clouds: bool,
+    cloud_shadows: bool,
     precipitation: bool,
     fog: bool,
 ) {
@@ -703,6 +726,7 @@ fn set(
     k.atmosphere.environment_light = sky_lighting;
     k.weather.sky = sky;
     k.weather.clouds = clouds;
+    k.cloud_shadows.enabled = cloud_shadows;
     k.weather.precipitation = precipitation;
     k.weather.distance_fog = fog;
     k.weather.volumetric_fog = fog;
@@ -716,6 +740,7 @@ struct SavedState {
     atmosphere: AtmosphereConfig,
     precipitation: PrecipitationConfig,
     clouds: CloudConfig,
+    cloud_shadows: CloudShadowConfig,
     conditions: WeatherConditions,
     procedural: bool,
     paused: bool,
@@ -812,6 +837,7 @@ fn run_benchmark(
     mut atmosphere: ResMut<AtmosphereConfig>,
     mut precipitation: ResMut<PrecipitationConfig>,
     mut cloud_config: ResMut<CloudConfig>,
+    mut cloud_shadows: ResMut<CloudShadowConfig>,
     mut weather: ResMut<Weather>,
     mut procedural: ResMut<ProceduralWeather>,
     mut weather_time: ResMut<WeatherTime>,
@@ -827,6 +853,7 @@ fn run_benchmark(
             atmosphere: atmosphere.clone(),
             precipitation: precipitation.clone(),
             clouds: cloud_config.clone(),
+            cloud_shadows: cloud_shadows.clone(),
             conditions: weather.target,
             procedural: procedural.enabled,
             paused: weather_time.paused,
@@ -864,6 +891,7 @@ fn run_benchmark(
             *atmosphere = saved.atmosphere;
             *precipitation = saved.precipitation;
             *cloud_config = saved.clouds;
+            *cloud_shadows = saved.cloud_shadows;
             weather.set_immediate(saved.conditions);
             procedural.enabled = saved.procedural;
             weather_time.paused = saved.paused;
@@ -883,6 +911,7 @@ fn run_benchmark(
             atmosphere: &mut atmosphere,
             precipitation: &mut precipitation,
             clouds: &mut cloud_config,
+            cloud_shadows: &mut cloud_shadows,
             conditions: &mut weather,
         });
     }

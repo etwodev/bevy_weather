@@ -46,6 +46,10 @@ struct SkyUniform {
     moon_params: vec4<f32>,
     moon_tint: vec4<f32>,
 
+    // x: meteors per minute. y: trail arc length, radians.
+    // z: trail width, radians. w: brightness.
+    meteor_params: vec4<f32>,
+
     // x: coverage. y: density. z: base altitude, m. w: thickness, m.
     cloud_params0: vec4<f32>,
     // x: shape scale, m. y: detail scale, m. z: detail strength. w: extinction.
@@ -85,6 +89,7 @@ const FLAG_GALAXY: u32 = 2u;
 const FLAG_MOON: u32 = 4u;
 const FLAG_CLOUDS: u32 = 8u;
 const FLAG_ADAPTIVE_MARCH: u32 = 16u;
+const FLAG_METEORS: u32 = 32u;
 
 const PI: f32 = 3.14159265359;
 const MAX_MARCH_DISTANCE: f32 = 160000.0;
@@ -98,6 +103,17 @@ const MAX_MARCH_DISTANCE: f32 = 160000.0;
 const SUNLIT_RADIANCE: f32 = 41000.0;
 // A clear daytime sky is around 15 klx, so its radiance is far lower.
 const SKY_RADIANCE: f32 = 5000.0;
+
+// How much of the night-sky moon radiance reaches a cloud deck.
+//
+// Not a physical ratio. True moonlight is about one four-hundred-thousandth of
+// sunlight, which at a fixed daylight exposure is indistinguishable from black;
+// the moon's own radiance is already exaggerated by `NIGHT_SCALE` on the Rust
+// side so that it reads as a bright object, and this carries the same
+// exaggeration across to what it illuminates. Set so a full moon on a broken
+// deck gives clearly modelled, clearly moonlit cloud without competing with
+// daylight.
+const MOONLIT_CLOUD_SCALE: f32 = 1.6;
 
 struct Vertex {
     @location(0) position: vec3<f32>,
@@ -402,7 +418,11 @@ fn galaxy(star_dir: vec3<f32>) -> vec3<f32> {
 // Moon
 // ---------------------------------------------------------------------------
 
-fn moon(ray: vec3<f32>) -> vec3<f32> {
+/// The moon's disc and its glow.
+///
+/// Returns `rgb` radiance in `xyz` and how much of the pixel the solid disc
+/// covers in `w`, so the star field can be hidden behind it.
+fn moon(ray: vec3<f32>) -> vec4<f32> {
     let moon_dir = sky.moon_direction.xyz;
     let angular_radius = max(sky.moon_direction.w, 1e-5);
     let cos_angle = dot(ray, moon_dir);
@@ -418,7 +438,7 @@ fn moon(ray: vec3<f32>) -> vec3<f32> {
     // glare belongs in the bloom pass, where it is applied to the composited
     // image and is hidden along with whatever produced it.
     let angle = acos(clamp(cos_angle, -1.0, 1.0));
-    let halo = exp(-angle / (angular_radius * 5.0)) * 0.03;
+    let halo = exp(-angle / (angular_radius * 5.0)) * 0.06;
 
     var result = vec3(0.0);
 
@@ -430,36 +450,177 @@ fn moon(ray: vec3<f32>) -> vec3<f32> {
         let bitangent = cross(moon_dir, tangent);
         let offset = vec2(dot(ray, tangent), dot(ray, bitangent)) / sin(angular_radius);
         let r2 = saturate(dot(offset, offset));
-        let normal = normalize(tangent * offset.x + bitangent * offset.y - moon_dir * sqrt(1.0 - r2));
+        // Cosine of the emission angle: one at the centre of the disc, zero at
+        // the limb. Since every ray that hits the moon is within a quarter of a
+        // degree of `moon_dir`, this is exactly `dot(normal, -moon_dir)`.
+        let mu = sqrt(1.0 - r2);
+        let normal = normalize(tangent * offset.x + bitangent * offset.y - moon_dir * mu);
 
         // The sun is effectively at infinity for both of us, so its direction
         // at the moon is the same as ours. That makes the terminator, and
         // therefore the phase, fall straight out of the geometry -- no separate
         // crescent mask needed.
-        let lambert = saturate(dot(normal, sky.sun_direction.xyz));
+        let mu0 = dot(normal, sky.sun_direction.xyz);
 
         // Maria and craters, from noise on the surface point.
         let surface = fbm3(normal * 6.0, 4);
         let craters = billow3(normal * 22.0, 3);
         let albedo = mix(0.62, 1.0, surface) * mix(0.82, 1.0, craters);
 
-        // The moon is a famously back-scattering body: it stays nearly as
-        // bright at the limb as at the centre, which is why a full moon reads
-        // as a flat disc rather than a shaded ball.
-        let retro = 0.55 + 0.45 * pow(lambert, 0.42);
+        // The lunar-Lambert law, which is what makes the moon look like the
+        // moon rather than like a ball.
+        //
+        // A Lambertian sphere lit from behind the camera shades from bright at
+        // the centre to black at the limb, and reads unmistakably as a sphere.
+        // The moon does not: its regolith is a deep, porous layer that scatters
+        // light back the way it came, so brightness falls off with the
+        // *emission* angle almost exactly as fast as it grows with the
+        // incidence angle. The two cancel, and a full moon is a flat disc with
+        // a hard edge -- which is how everyone has always seen it.
+        //
+        // `mu0 / (mu0 + mu)` -- Lommel-Seeliger -- is that cancellation written
+        // down. At opposition `mu0` and `mu` are equal everywhere on the disc,
+        // so the ratio is one half at every point and the disc is perfectly
+        // even; the factor of two renormalises that back to full brightness.
+        //
+        // On its own, though, it overshoots. Away from opposition `mu` still
+        // goes to zero at the limb while `mu0` does not, so the ratio runs up
+        // to one and the renormalised value to two: a half moon comes out with
+        // a hot wire traced around its edge. Real regolith only behaves this
+        // way near opposition, and mixes back toward Lambert as the phase angle
+        // opens up -- so the two laws are blended on exactly that angle. The
+        // limb still brightens at a quarter moon, by about a third, which is
+        // what the real one does.
+        let phase_angle = acos(clamp(dot(sky.sun_direction.xyz, -moon_dir), -1.0, 1.0));
+        let retro = exp(-phase_angle / 1.05);
+        let lit_side = saturate(mu0);
+        let lommel_seeliger = 2.0 * lit_side / max(lit_side + mu, 1e-3);
+        let reflectance = retro * lommel_seeliger + (1.0 - retro) * lit_side;
+        // Softening a degree or so of the terminator. The real one is sharp,
+        // but not sharper than a pixel, and surface relief blurs it further.
+        let terminator = smoothstep(-0.03, 0.06, mu0);
 
         // Earthshine: sunlight bounced off the planet onto the dark limb. It is
         // what makes "the old moon in the new moon's arms".
         let earthshine = sky.moon_params.y * (1.0 - sky.moon_color.a) * 0.5;
 
         let contrast = mix(1.0, albedo, saturate(sky.moon_params.z));
-        let lit = lambert * retro * contrast + earthshine * contrast;
+        let lit = reflectance * terminator * contrast + earthshine * contrast;
         result += sky.moon_tint.rgb * lit * sky.moon_params.x * disc;
     }
 
     // Only a lit moon glows.
     result += sky.moon_tint.rgb * halo * sky.moon_params.x * sky.moon_color.a;
-    return result;
+    return vec4(result, disc);
+}
+
+// ---------------------------------------------------------------------------
+// Meteors
+// ---------------------------------------------------------------------------
+
+/// How many meteors can be in the air at once.
+///
+/// Every slot is evaluated for every pixel of night sky, so this is a fixed
+/// cost rather than a budget: four is enough that a busy shower never runs out
+/// of slots, and cheap enough that an empty sky barely notices.
+const METEOR_SLOTS: i32 = 4;
+
+/// How long a meteor takes to cross its arc, in seconds.
+///
+/// An absolute time rather than a fraction of the slot's period, which matters:
+/// tie it to the period and raising the rate makes every meteor proportionally
+/// faster, so the sky never actually gets busier -- the same fraction of the
+/// time has a streak in it, the streaks are just briefer. Real meteors last a
+/// few tenths of a second whether it is an ordinary night or the Perseids.
+const METEOR_DURATION: f32 = 0.7;
+
+/// Shooting stars: brief streaks along great circles.
+///
+/// Each slot runs its own clock. On every tick it draws a fresh random entry
+/// point and heading from the tick number, so a meteor is a pure function of
+/// the time -- nothing is simulated, nothing is stored, and every camera
+/// watching the same sky sees the same meteor in the same place.
+fn meteors(ray: vec3<f32>, time: f32) -> vec3<f32> {
+    let rate = sky.meteor_params.x;
+    if rate <= 0.0 {
+        return vec3(0.0);
+    }
+    let arc = max(sky.meteor_params.y, 1e-3);
+    let width = max(sky.meteor_params.z, 1e-4);
+    let brightness = sky.meteor_params.w;
+
+    // Seconds between meteors anywhere in the sky, spread over the slots.
+    let period = 60.0 / rate * f32(METEOR_SLOTS);
+    var total = vec3(0.0);
+
+    for (var i = 0; i < METEOR_SLOTS; i += 1) {
+        let slot = f32(i);
+        let clock = time / period + slot * 0.61803399;
+        let tick = floor(clock);
+        let u = fract(clock) * period / METEOR_DURATION;
+        if u > 1.0 {
+            continue;
+        }
+
+        let seed = hash33(vec3(tick, slot, 17.13));
+        let seed2 = hash33(vec3(tick * 1.37 + 5.1, slot, 91.7));
+
+        // Entry point, biased into the upper hemisphere: a meteor drawn below
+        // the horizon is a slot spent on nothing, since the sky is masked off
+        // down there anyway.
+        let azimuth = seed.x * 2.0 * PI;
+        let height = 0.12 + seed.y * 0.88;
+        let ring = sqrt(max(1.0 - height * height, 0.0));
+        let entry = vec3(cos(azimuth) * ring, height, sin(azimuth) * ring);
+
+        // A heading perpendicular to the entry point, so the two span the plane
+        // the meteor's great circle lies in.
+        let reference = select(vec3(0.0, 1.0, 0.0), vec3(1.0, 0.0, 0.0), abs(entry.y) > 0.9);
+        let east = normalize(cross(reference, entry));
+        let north = cross(entry, east);
+        let heading = seed2.x * 2.0 * PI;
+        let along = east * cos(heading) + north * sin(heading);
+
+        // Where the ray falls in the meteor's own frame.
+        let x = dot(ray, entry);
+        let y = dot(ray, along);
+        let off_plane = dot(ray, normalize(cross(entry, along)));
+        // Angle around the great circle, measured from the entry point.
+        let angle = atan2(y, x);
+
+        // Longer, brighter meteors are rarer, the same way they are in life.
+        let magnitude = pow(seed2.y, 2.0);
+        let length = arc * (0.35 + magnitude * 1.3);
+        let head = u * length;
+        let behind = head - angle;
+        if behind < 0.0 || behind > length {
+            continue;
+        }
+
+        // Across the trail, and then along it: brightest at the head, trailing
+        // off behind. The head itself is a little fatter than the tail.
+        let taper = exp(-behind / (length * 0.28));
+        let trail_width = width * (0.45 + 0.55 * taper);
+        let across = exp(-(off_plane * off_plane) / (trail_width * trail_width));
+        // The burning grain itself, a good deal brighter than the trail it
+        // leaves. Without it a meteor reads as a scratch on the lens rather
+        // than as something moving.
+        let head_radius = width * 2.5;
+        let head_glow = exp(-(behind * behind) / (head_radius * head_radius));
+
+        // In and out over the meteor's life, so it does not pop.
+        let life = sin(u * PI);
+
+        // Faster, brighter ones run hotter and bluer-white; slow ones are the
+        // orange of burning iron.
+        let hot = vec3(0.80, 0.88, 1.0);
+        let cool = vec3(1.0, 0.72, 0.40);
+        let tint = mix(cool, hot, magnitude);
+
+        total += tint * (across * (taper + head_glow * 2.0) * life * (0.4 + magnitude * 2.2));
+    }
+
+    return total * brightness;
 }
 
 // ---------------------------------------------------------------------------
@@ -627,13 +788,23 @@ fn henyey_greenstein(cos_angle: f32, g: f32) -> f32 {
     return (1.0 - g2) / (4.0 * PI * max(pow(denominator, 1.5), 1e-4));
 }
 
-/// Optical depth from `position` toward the sun, by short-stepping outward.
-fn light_march(position: vec3<f32>, planet: f32, steps: i32, lod: i32) -> f32 {
+/// Optical depth from `position` toward `light_dir`, by short-stepping outward.
+///
+/// The direction is a parameter rather than always the sun because the moon
+/// lights a cloud deck the same way the sun does, only fainter -- and a deck
+/// lit from a direction it is not self-shadowed along is the giveaway that the
+/// moonlight is faked.
+fn light_march(
+    position: vec3<f32>,
+    light_dir: vec3<f32>,
+    planet: f32,
+    steps: i32,
+    lod: i32,
+) -> f32 {
     if steps <= 0 {
         return 0.0;
     }
     let thickness = max(sky.cloud_params0.w, 1.0);
-    let sun = sky.sun_direction.xyz;
     // Cone-ish stepping: short steps near the sample capture local
     // self-shadowing, long ones catch the bulk of the cloud above.
     var optical_depth = 0.0;
@@ -642,10 +813,40 @@ fn light_march(position: vec3<f32>, planet: f32, steps: i32, lod: i32) -> f32 {
     for (var i = 0; i < steps; i += 1) {
         let step_size = base_step * (0.5 + f32(i));
         travelled += step_size;
-        let sample = cloud_density(position + sun * travelled, planet, lod, 0.0);
+        let sample = cloud_density(position + light_dir * travelled, planet, lod, 0.0);
         optical_depth += sample.density * step_size;
     }
     return optical_depth;
+}
+
+/// The cloud's angular scattering profile: a tight forward lobe for the silver
+/// lining and a broad backward one so cloud facing away from the light does not
+/// go flat and dead.
+///
+/// Normalised so that averaging it over the sphere gives one, which is what
+/// lets a fully lit, unshadowed cloud come out at the source radiance rather
+/// than at some arbitrary multiple of it.
+fn cloud_phase(cos_angle: f32, forward_g: f32, back_g: f32) -> f32 {
+    let lobes = mix(
+        henyey_greenstein(cos_angle, forward_g),
+        henyey_greenstein(cos_angle, back_g),
+        0.35,
+    );
+    return lobes * 4.0 * PI;
+}
+
+/// How much of a body at direction `dir` still shines on a cloud deck whose
+/// mid-height is `cloud_top` metres up.
+///
+/// A deck sits kilometres above the observer, so it stays lit well after the
+/// body has set at ground level -- the horizon seen from height `h` is
+/// depressed by about `sqrt(2h/R)`, which is exactly why the undersides of
+/// clouds are the last thing to lose the light at dusk. Below that the deck
+/// really is in the planet's shadow, and anything still arriving from that
+/// direction is light leaking through the world.
+fn body_above_cloud_horizon(dir_y: f32, cloud_top: f32, planet: f32) -> f32 {
+    let cloud_horizon = -sqrt(2.0 * cloud_top / planet);
+    return smoothstep(cloud_horizon - 0.025, cloud_horizon + 0.025, dir_y);
 }
 
 struct CloudResult {
@@ -713,32 +914,40 @@ fn march_clouds(
         return result;
     }
 
-    let cos_sun = dot(ray, sky.sun_direction.xyz);
-    // Two lobes: a tight forward one for the silver lining, a broad backward
-    // one so cloud away from the sun does not go flat and dead.
-    let phase = mix(
-        henyey_greenstein(cos_sun, forward_g),
-        henyey_greenstein(cos_sun, back_g),
-        0.35,
-    );
+    let sun_phase = cloud_phase(dot(ray, sky.sun_direction.xyz), forward_g, back_g);
+    // The moon gets its own phase term, about its own direction.
+    //
+    // Sharing the sun's was the single worst thing in this shader: at night the
+    // sun is below the horizon but its phase lobes are not, so the moonlight --
+    // which is all there is -- was being poured into the sky wherever the sun
+    // happened to be underneath the world. The result is a sunset that never
+    // quite goes out, glowing through the cloud from below at midnight, and a
+    // moon that never casts a silver lining of its own.
+    let moon_phase = cloud_phase(dot(ray, sky.moon_direction.xyz), forward_g, back_g);
 
-    // A cloud deck sits kilometres up, so it stays in sunlight well after the
-    // sun has set for an observer on the ground. The depression of the horizon
-    // seen from height h is about sqrt(2h/R) -- which is exactly why the
-    // undersides of clouds are the last thing to lose the light at dusk.
     let cloud_top = base_altitude + thickness * 0.5;
-    let cloud_horizon = -sqrt(2.0 * cloud_top / planet);
-    let sun_up = smoothstep(cloud_horizon - 0.025, cloud_horizon + 0.025, sky.sun_direction.xyz.y);
+    let sun_up = body_above_cloud_horizon(sky.sun_direction.xyz.y, cloud_top, planet);
+    let moon_up = body_above_cloud_horizon(sky.moon_direction.xyz.y, cloud_top, planet);
 
     let sun_light = sky.sun_color.rgb * SUNLIT_RADIANCE * sun_up;
-    // `moon_color.rgb` already carries the night-sky scale factor.
-    let moon_light = sky.moon_color.rgb * sky.moon_color.a * 0.35;
+    // `moon_color.rgb` already carries the night-sky scale factor. Faded out as
+    // the sun comes up, because a moon competing with daylight lights nothing.
+    let night = 1.0 - saturate(sky.sun_color.a);
+    let moon_light =
+        sky.moon_color.rgb * sky.moon_color.a * moon_up * night * MOONLIT_CLOUD_SCALE;
     // Skylight bouncing around inside and under the deck. Without this the
     // shadowed side of a cloud reads as a hole in the sky. Albedo is applied
     // once, below, along with the direct term.
-    let ambient = vec3(ambient_strength * (SKY_RADIANCE * sun_up + 4.0));
+    //
+    // The moon contributes here too, and has to: with only a direct term the
+    // half of a moonlit cloud facing away from the moon is pure black, which is
+    // a silhouette rather than a cloud.
+    let ambient = vec3(ambient_strength * (SKY_RADIANCE * sun_up + 4.0))
+        + moon_light * (ambient_strength * 0.25);
 
     let adaptive = (u32(sky.misc.w) & FLAG_ADAPTIVE_MARCH) != 0u;
+    // Whether the moon is contributing enough to be worth a second light march.
+    let moonlit = max(max(moon_light.r, moon_light.g), moon_light.b) > 1.0;
 
     let span = far - near;
     let fine_step = span / f32(steps);
@@ -854,6 +1063,7 @@ fn march_clouds(
         let sigma = sample.density * extinction;
 
         var sun_transmittance = 1.0;
+        var moon_transmittance = 1.0;
         // One formula for the whole march, not two.
         //
         // Skipping the light march once the ray is mostly extinguished looks
@@ -869,13 +1079,31 @@ fn march_clouds(
         //
         // Any switch between two formulas has to be made where they agree, or
         // it has to be blended. This one is neither, so it is gone.
+        // Cheap stand-in for when there is no budget to march: assume the
+        // cloud above is as dense as here.
+        let above = (1.0 - sample.height) * thickness;
+        let flat_transmittance = exp(-sample.density * extinction * above * 0.5);
         if light_steps > 0 {
-            sun_transmittance =
-                exp(-light_march(position, planet, light_steps, light_lod) * extinction);
+            // Only march toward a body that is actually lighting anything. The
+            // two gates are uniform across the whole draw, so this is a branch
+            // the whole wavefront agrees on -- and in practice at most one of
+            // them is ever open, because the moon's contribution is faded out
+            // by daylight and the sun's by its own horizon.
+            if sun_up > 0.0 {
+                sun_transmittance = exp(
+                    -light_march(position, sky.sun_direction.xyz, planet, light_steps, light_lod)
+                        * extinction,
+                );
+            }
+            if moonlit {
+                moon_transmittance = exp(
+                    -light_march(position, sky.moon_direction.xyz, planet, light_steps, light_lod)
+                        * extinction,
+                );
+            }
         } else {
-            // Cheap stand-in: assume the cloud above is as dense as here.
-            let above = (1.0 - sample.height) * thickness;
-            sun_transmittance = exp(-sample.density * extinction * above * 0.5);
+            sun_transmittance = flat_transmittance;
+            moon_transmittance = flat_transmittance;
         }
 
         // Powder: multiple scattering makes deep cloud darker than a
@@ -883,11 +1111,12 @@ fn march_clouds(
         // their crisp, sculpted look.
         let powder = mix(1.0, 1.0 - exp(-sample.density * 8.0), powder_strength);
 
-        // `phase * 4 * PI` is the phase function normalised to average one, so
-        // a fully lit, unshadowed cloud comes out at `SUNLIT_RADIANCE` rather
-        // than at some arbitrary multiple of it.
-        let direct =
-            (sun_light * sun_transmittance + moon_light) * (phase * 4.0 * PI) * powder;
+        // Each body carries its own phase and its own self-shadowing, so a
+        // moonlit deck is lit from where the moon is rather than from wherever
+        // the sun went down.
+        let direct = (sun_light * sun_transmittance * sun_phase
+            + moon_light * moon_transmittance * moon_phase)
+            * powder;
         let source = (direct + ambient) * sky.cloud_albedo.rgb;
 
         // Lightning lights the cloud from within, brightest deep inside it.
@@ -1054,25 +1283,40 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     // altitude, a full sky by about -15.
     let night = 1.0 - smoothstep(-0.26, -0.05, sky.sun_direction.y);
 
+    // The moon occupies a fraction of a degree, so the overwhelming majority of
+    // pixels are nowhere near it. One dot product rejects them before any of
+    // the surface noise is evaluated.
+    var moon_cover = 0.0;
+    if (flags & FLAG_MOON) != 0u
+        && dot(ray, sky.moon_direction.xyz) > cos(sky.moon_direction.w * 18.0) {
+        let disc = moon(ray);
+        // A pale daytime moon against a blue sky is a real sight, so it keeps
+        // a fraction of its brightness rather than vanishing at sunrise.
+        color += disc.rgb * mix(0.12, 1.0, night);
+        moon_cover = disc.w;
+    }
+
     // Skipping outright rather than computing and multiplying by zero. In
     // daylight that is sixty-odd hashes a pixel saved for a result that was
     // always going to be invisible.
     if night > 0.002 {
+        // Everything here is a quarter of a million miles further away than the
+        // moon, so the moon's disc has to hide it. Added rather than composited
+        // is what makes stars twinkle *through* a solid rock, which is the kind
+        // of thing the eye picks up immediately even at twenty pixels across.
+        let behind_moon = 1.0 - moon_cover;
         if (flags & FLAG_GALAXY) != 0u {
-            color += galaxy(star_dir) * night;
+            color += galaxy(star_dir) * night * behind_moon;
         }
         if (flags & FLAG_STARS) != 0u {
-            color += star_field(star_dir, horizon_factor) * night;
+            color += star_field(star_dir, horizon_factor) * night * behind_moon;
         }
-    }
-    // The moon occupies a fraction of a degree, so the overwhelming majority of
-    // pixels are nowhere near it. One dot product rejects them before any of
-    // the surface noise is evaluated.
-    if (flags & FLAG_MOON) != 0u
-        && dot(ray, sky.moon_direction.xyz) > cos(sky.moon_direction.w * 18.0) {
-        // A pale daytime moon against a blue sky is a real sight, so it keeps
-        // a fraction of its brightness rather than vanishing at sunrise.
-        color += moon(ray) * mix(0.12, 1.0, night);
+        if (flags & FLAG_METEORS) != 0u {
+            // Meteors burn up sixty miles up, well inside the moon's orbit, so
+            // unlike the stars they are not occluded by it -- but they are so
+            // brief that it never comes up.
+            color += meteors(ray, sky.misc.x) * night;
+        }
     }
 
     // Nothing above the horizon should be visible below it.

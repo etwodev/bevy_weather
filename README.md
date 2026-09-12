@@ -38,8 +38,10 @@ the stars come out.
 | **Atmosphere** | Bevy's built-in Bruneton scattering, wired up and quality-scaled. |
 | **Stars** | Procedural, with a realistic magnitude distribution, colour temperature and horizon-weighted scintillation. Fixed to the celestial sphere, so they rotate about the pole and drift by sidereal time. |
 | **Galaxy** | Procedural Milky Way with dust lanes and a central bulge, at the correct angle to the celestial equator. |
-| **Moon** | Phase-correct, because the terminator is computed from real geometry rather than masked. Procedural maria, craters and earthshine. |
+| **Moon** | Phase-correct, because the terminator is computed from real geometry rather than masked. Lunar-Lambert shading, so a full moon reads as a flat disc rather than a shaded ball. Procedural maria, craters and earthshine. |
+| **Meteors** | Shooting stars on great-circle paths, a pure function of the clock, so every client sees the same one in the same place. |
 | **Volumetric clouds** | Raymarched through a curved planetary shell, with light marching, Henyey–Greenstein phase, powder and wind advection. |
+| **Cloud shadows** | The deck's own shape, projected onto the ground along the sun as a light cookie, drifting with the same wind. |
 | **Volumetric fog** | Bevy's fog volumes and god rays, driven by weather and time of day. |
 | **Rain and snow** | GPU-resident particle fields. One draw call each, tens of thousands of particles, world-anchored. |
 | **Thunder** | Poisson-scheduled strikes with multi-stroke flash envelopes, scene lighting, in-cloud glow and speed-of-sound thunder delay. |
@@ -171,7 +173,9 @@ Every subsystem has its own resource, all mutable at runtime:
 | `AtmosphereConfig` | Scattering density, exposure, tonemapping, bloom |
 | `SunConfig` | Sun disc size and brightness |
 | `StarConfig`, `GalaxyConfig`, `MoonConfig` | The night sky |
+| `MeteorConfig` | Shooting star rate, length and brightness |
 | `CloudConfig` | Cloud look and raymarch cost |
+| `CloudShadowConfig` | Ground shadows cast by the cloud deck |
 | `FogConfig` | Fog colour, visibility range and volume size |
 | `PrecipitationConfig` | Particle counts, sizes, speeds |
 | `ThunderConfig` | Strike rate, distance, flash |
@@ -225,7 +229,17 @@ Everything the shaders emit is in physical radiance and is multiplied by
 * **Exposure.** The atmosphere is calibrated in physical units, so
   `AtmosphereConfig` sets `Exposure { ev100: 13.0 }` and ACES tonemapping on
   weather cameras by default. Set `exposure_ev100: None` to manage exposure
-  yourself.
+  yourself. Around sunrise and sunset it opens up by
+  `AtmosphereConfig::twilight_exposure_lift` stops and closes again once it is
+  properly dark — a stand-in for the adaptation that makes an afterglow look
+  like something rather than like the near-black a fixed daylight exposure
+  records.
+* **Haze is a dial.** `AtmosphereConfig::aerosol_density` scales the Mie layer
+  on its own. Aerosols sit in the lowest kilometre or two and scatter strongly
+  forward without much colour preference, so at a low sun they take the reddened
+  beam and spread it across a wide arc of sky. It is the difference between a
+  thin orange line on the horizon and half the sky going gold; the default is a
+  little hazier than clean air for exactly that reason.
 * **The sun and moon are drawn larger than life.** Both are half a degree
   across in reality — about twenty pixels at a typical field of view, too few to
   show a lunar phase at all. `SunConfig::angular_radius` and
@@ -243,8 +257,23 @@ Everything the shaders emit is in physical radiance and is multiplied by
   across twilight rather than being drowned by daylight on their own.
 * **Clouds are a sky-layer effect.** They are raymarched through a curved
   planetary shell above the camera and read correctly from the ground or a hill.
-  Flying *through* the layer works but is not the case it is tuned for, and they
-  do not cast shadows on the ground.
+  Flying *through* the layer works but is not the case it is tuned for.
+* **Cloud shadows go through a light cookie.** The deck's shape is evaluated on
+  the CPU from the same field the sky shader marches and projected along the
+  sun with `DirectionalLightTexture`, so no extra render pass is involved. That
+  machinery is Bevy's clustered decals, which need the `pbr_light_textures`
+  feature (this crate enables it) and a GPU with texture binding arrays. Where
+  either is missing the texture is simply never sampled and lighting is normal,
+  just unshadowed. The pattern repeats every `CloudShadowConfig::tile_size`.
+* **Sunset colour comes from the atmosphere, not from the light.** Bevy's
+  atmosphere integrates the transmittance from the sun itself, so it expects the
+  raw solar spectrum — the same way `illuminance` is the raw 128 klx rather than
+  what reaches the ground. Hand it a pre-reddened light and the extinction is
+  applied twice, and since Rayleigh scattering is six times stronger in blue
+  than in red, scattering an already-orange sun gives a muddy olive sky rather
+  than an orange one. `SunConfig::light_tint` splits the difference: enough
+  warmth on the key light for a golden hour, little enough that the sky stays
+  the atmosphere's to colour.
 * **Fog is two effects.** `DistanceFog` and a matching fade in the sky shader do
   the visibility work, because they blend toward a colour — which is what makes
   heavy fog a white-out rather than a black-out. The volumetric pass adds god
@@ -271,7 +300,9 @@ cargo run --example showcase --release
 
 An interactive tour: fly around with `WASD` and the mouse, scrub the clock,
 cycle presets and climates, and toggle each subsystem. The on-screen panel lists
-the keys and shows the live weather state.
+the keys and shows the live weather state. `8` turns the meteor rate up to a
+shower, since at the honest rate you could watch for a long time without seeing
+one.
 
 ### Building for Windows from macOS or Linux
 
@@ -361,6 +392,8 @@ In rough order of leverage:
 | `CloudConfig::detail_distance` | How far out erosion detail is still worth computing. Lower it to buy back time on a broken sky, where much of the screen is distant cloud near the horizon. |
 | `WeatherConfig::clouds` | Off is free. A clear sky already costs nothing — the raymarch is skipped when coverage is zero. |
 | `AtmosphereConfig::environment_map_size` | Regenerated every frame; 512 buys nothing over 128 for ambient light. |
+| `CloudShadowConfig::resolution` | The shadow texture is rebuilt on the CPU: about 1.5 ms at 64, 6 ms at 128, 20 ms at 256, spread across the frames of `update_seconds` rather than landing on one. |
+| `CloudShadowConfig::enabled` | Off is free. |
 | `PrecipitationConfig::particle_count` | Fill-rate bound, so it also scales with `box_size`. |
 
 `CloudConfig::adaptive_marching` exists only so the fast path can be measured

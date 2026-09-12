@@ -2,6 +2,8 @@
 
 pub mod atmosphere;
 pub mod celestial;
+pub mod cloud_field;
+pub mod cloud_shadows;
 pub mod clouds;
 pub mod config;
 pub mod fog;
@@ -23,13 +25,14 @@ use bevy::prelude::Update;
 pub mod prelude {
     pub use crate::atmosphere::AtmosphereConfig;
     pub use crate::celestial::{CelestialBodies, MoonLight, SunConfig, SunLight};
+    pub use crate::cloud_shadows::CloudShadowConfig;
     pub use crate::clouds::CloudConfig;
     pub use crate::config::{Quality, WeatherCamera, WeatherConfig};
     pub use crate::fog::FogConfig;
     pub use crate::precipitation::PrecipitationConfig;
     pub use crate::presets::WeatherPreset;
     pub use crate::procedural::{Climate, ProceduralWeather};
-    pub use crate::sky::{GalaxyConfig, MoonConfig, StarConfig};
+    pub use crate::sky::{GalaxyConfig, MeteorConfig, MoonConfig, StarConfig};
     pub use crate::state::{Weather, WeatherConditions};
     pub use crate::thunder::{LightningStrike, ThunderConfig};
     pub use crate::time::WeatherTime;
@@ -99,6 +102,7 @@ impl Plugin for WeatherPlugin {
             celestial::CelestialPlugin,
             atmosphere::WeatherAtmospherePlugin,
             sky::SkyPlugin,
+            cloud_shadows::CloudShadowPlugin,
             fog::WeatherFogPlugin,
             precipitation::PrecipitationPlugin,
             thunder::ThunderPlugin,
@@ -131,6 +135,7 @@ impl PluginGroup for WeatherPlugins {
             .add(celestial::CelestialPlugin)
             .add(atmosphere::WeatherAtmospherePlugin)
             .add(sky::SkyPlugin)
+            .add(cloud_shadows::CloudShadowPlugin)
             .add(fog::WeatherFogPlugin)
             .add(precipitation::PrecipitationPlugin)
             .add(thunder::ThunderPlugin)

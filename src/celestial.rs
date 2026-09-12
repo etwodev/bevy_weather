@@ -8,7 +8,10 @@ use bevy::ecs::query::{With, Without};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::IntoScheduleConfigs;
 use bevy::ecs::system::{Commands, Query, Res, ResMut};
-use bevy::light::{AmbientLight, DirectionalLight, SunDisk, VolumetricLight, light_consts::lux};
+use bevy::light::{
+    AmbientLight, CascadeShadowConfig, CascadeShadowConfigBuilder, DirectionalLight, SunDisk,
+    VolumetricLight, light_consts::lux,
+};
 use bevy::math::Vec3;
 use bevy::prelude::Entity;
 use bevy::reflect::Reflect;
@@ -59,6 +62,70 @@ pub struct SunConfig {
     /// else on screen, so this mostly controls how far the glare bleeds once
     /// bloom gets hold of it.
     pub disk_intensity: f32,
+
+    /// How much of the sun's atmospheric reddening to put on the
+    /// [`DirectionalLight`] itself, `0.0..=1.0`.
+    ///
+    /// This one number decides whether sunsets look right, so it is worth
+    /// knowing what it does.
+    ///
+    /// Bevy's atmosphere is a Bruneton model: it integrates the transmittance
+    /// from the sun to every point along the view ray itself, and reddening the
+    /// sky is precisely what that integral is *for*. It expects to be handed
+    /// the raw solar spectrum -- unfiltered white -- exactly as it expects to be
+    /// handed [`lux::RAW_SUNLIGHT`] rather than the 100 klx that reaches the
+    /// ground.
+    ///
+    /// Give it a pre-reddened light instead and the extinction is applied
+    /// twice, which does not simply deepen the colour: Rayleigh scattering is
+    /// about six times stronger in blue than in red, so scattering an already
+    /// orange sun leaves the sky a muddy olive grey instead of orange. The
+    /// spectacular part of a sunset disappears and what is left looks like
+    /// pollution.
+    ///
+    /// The catch is that the same light also lights your geometry, and Bevy
+    /// applies no transmittance to *that* -- so a fully neutral light means
+    /// objects stand in white sunlight at dusk while the sky behind them burns.
+    /// This splits the difference: enough warmth on the key light for a golden
+    /// hour, little enough that the sky is still the atmosphere's to colour.
+    /// `0.0` is the physically correct input to the atmosphere; `1.0` restores
+    /// the old double-counted behaviour.
+    pub light_tint: f32,
+
+    /// How far from the camera the sun casts shadows, in world units.
+    ///
+    /// Bevy's default is 150, which is a reasonable figure for an indoor or
+    /// arena-sized scene and much too short for anything with a horizon: the
+    /// shadows simply stop part way across the ground and everything beyond
+    /// stands in full sun.
+    pub shadow_distance: f32,
+
+    /// Far bound of the first shadow cascade, in world units.
+    ///
+    /// Cascades are the reason shadows look sharp near the camera and soft far
+    /// away: each covers a shell of distance at its own resolution. The seams
+    /// between them are blended for surfaces, but *not* inside the volumetric
+    /// fog pass, which picks one cascade per sample -- so wherever a boundary
+    /// falls, a god ray changes character across a line drawn at that exact
+    /// distance, and the line follows the camera around.
+    ///
+    /// Bevy's default puts the first one ten metres out, which is close enough
+    /// to read as a ring on the ground in front of the player. Pushing it out
+    /// costs some crispness in the shadows right at your feet and moves the
+    /// artefact somewhere it is not being stared at.
+    pub shadow_near_distance: f32,
+
+    /// How many shadow cascades the sun uses.
+    ///
+    /// Four is the usual outdoor choice. Fewer is cheaper and blockier; more
+    /// costs another shadow map render per cascade.
+    pub shadow_cascades: usize,
+
+    /// How much neighbouring cascades overlap, `0.0..1.0`.
+    ///
+    /// The overlap is the band the renderer cross-fades across, so a larger
+    /// value hides the seam better at the cost of some resolution.
+    pub shadow_cascade_overlap: f32,
 }
 
 impl Default for SunConfig {
@@ -67,6 +134,11 @@ impl Default for SunConfig {
             disk: true,
             angular_radius: 0.0105,
             disk_intensity: 1.0,
+            light_tint: 0.35,
+            shadow_distance: 900.0,
+            shadow_near_distance: 40.0,
+            shadow_cascades: 4,
+            shadow_cascade_overlap: 0.3,
         }
     }
 }
@@ -189,7 +261,7 @@ pub fn compute_celestial(time: &WeatherTime) -> CelestialBodies {
         moon_phase: phase,
         moon_illumination: time.moon_illumination(),
         daylight,
-        sun_color: sun_tint(sun_altitude),
+        sun_color: sun_tint(sun_altitude, 1.0),
         sun_angular_radius: DEFAULT_ANGULAR_RADIUS,
         moon_angular_radius: DEFAULT_ANGULAR_RADIUS,
     }
@@ -200,13 +272,18 @@ pub fn compute_celestial(time: &WeatherTime) -> CelestialBodies {
 /// This is a cheap stand-in for integrating transmittance along the view ray;
 /// the atmosphere pass does the real thing for the sky, but the clouds and the
 /// particles need a sun colour before that pass runs.
-fn sun_tint(sun_altitude: f32) -> LinearRgba {
+///
+/// `strength` scales the optical depth: `1.0` is the full ground-level colour,
+/// `0.0` is the unfiltered solar spectrum. See
+/// [`SunConfig::light_tint`] for why the light and the sky want different
+/// values.
+pub fn sun_tint(sun_altitude: f32, strength: f32) -> LinearRgba {
     // Air mass grows sharply as the sun approaches the horizon.
     let h = sun_altitude.max(0.0);
     let air_mass = 1.0 / (h + 0.05);
     // Rayleigh optical depth is roughly proportional to lambda^-4, so blue is
     // extinguished several times faster than red.
-    let tau = Vec3::new(0.021, 0.052, 0.128) * air_mass;
+    let tau = Vec3::new(0.021, 0.052, 0.128) * air_mass * strength.max(0.0);
     LinearRgba::rgb((-tau.x).exp(), (-tau.y).exp(), (-tau.z).exp())
 }
 
@@ -257,6 +334,7 @@ fn spawn_lights(
             },
             VolumetricLight,
             sun_disk(&sun_config),
+            sun_config.cascades(),
             Transform::default(),
         ));
     }
@@ -279,6 +357,25 @@ fn spawn_lights(
             SunDisk::OFF,
             Transform::default(),
         ));
+    }
+}
+
+impl SunConfig {
+    /// The cascade layout this configuration asks for.
+    ///
+    /// Clamped rather than asserted: `CascadeShadowConfigBuilder::build` panics
+    /// on out-of-range values, and a settings slider dragged to zero should not
+    /// take the game down.
+    pub fn cascades(&self) -> CascadeShadowConfig {
+        let near = self.shadow_near_distance.max(1.0);
+        CascadeShadowConfigBuilder {
+            num_cascades: self.shadow_cascades.clamp(1, 4),
+            minimum_distance: 0.1,
+            first_cascade_far_bound: near,
+            maximum_distance: self.shadow_distance.max(near + 1.0),
+            overlap_proportion: self.shadow_cascade_overlap.clamp(0.0, 0.9),
+        }
+        .build()
     }
 }
 
@@ -370,24 +467,42 @@ fn drive_lights(
     for (entity, mut transform, mut light, existing_disk) in &mut sun {
         // A directional light shines along its local `-Z`, so it must look
         // *away* from the body it represents.
+        //
+        // Rotation only. The light's translation and scale mean nothing to the
+        // lighting itself, but they position and size the cloud-shadow cookie,
+        // so overwriting the whole transform here would fight
+        // [`cloud_shadows`](crate::cloud_shadows) every frame -- and it would
+        // also stamp on anyone who has parented the light into their own rig.
         if bodies.sun_direction.y > -0.999 {
-            *transform = Transform::default().looking_to(-bodies.sun_direction, Vec3::Y);
+            transform.rotation = Transform::default()
+                .looking_to(-bodies.sun_direction, Vec3::Y)
+                .rotation;
         }
         // Fade out below the horizon rather than snapping, so shadows don't pop.
         let visibility = remap01(bodies.sun_altitude, -0.02, 0.06);
         light.illuminance = lux::RAW_SUNLIGHT * visibility * overcast * scale;
-        light.color = Color::LinearRgba(bodies.sun_color);
+        // Deliberately *not* `bodies.sun_color`. That is the colour sunlight
+        // has by the time it reaches the ground, which is what this plugin's
+        // own shaders want -- they composite outside the atmosphere pass and
+        // have to redden their own input. The atmosphere does its own
+        // extinction and wants the raw spectrum; see `SunConfig::light_tint`.
+        light.color = Color::LinearRgba(sun_tint(bodies.sun_altitude, sun_config.light_tint));
 
         // Only rewrite when something actually changed, so a user adjusting
         // `SunDisk` by hand on their own light is not fought every frame.
         if existing_disk.is_none() || sun_config.is_changed() {
-            commands.entity(entity).insert(disk.clone());
+            commands
+                .entity(entity)
+                .insert(disk.clone())
+                .insert(sun_config.cascades());
         }
     }
 
     for (mut transform, mut light) in &mut moon {
         if bodies.moon_direction.y > -0.999 {
-            *transform = Transform::default().looking_to(-bodies.moon_direction, Vec3::Y);
+            transform.rotation = Transform::default()
+                .looking_to(-bodies.moon_direction, Vec3::Y)
+                .rotation;
         }
         let visibility = remap01(bodies.moon_altitude, -0.02, 0.06);
         // Moonlight only reads once the sun is out of the way.
@@ -527,8 +642,8 @@ mod tests {
 
     #[test]
     fn sun_reddens_near_the_horizon() {
-        let noon = sun_tint(1.0);
-        let horizon = sun_tint(0.0);
+        let noon = sun_tint(1.0, 1.0);
+        let horizon = sun_tint(0.0, 1.0);
         // Blue is knocked down far harder than red at low sun.
         assert!(horizon.blue / horizon.red < noon.blue / noon.red);
         assert!(horizon.blue < 0.2, "{}", horizon.blue);

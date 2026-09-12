@@ -117,6 +117,12 @@ pub struct FogConfig {
     pub min_visibility: f32,
 
     /// Visibility in world units with no fog at all.
+    ///
+    /// This is *clear air*, so it should be a long way: the meteorological
+    /// figure for a clear day is twenty to fifty kilometres, and what closes
+    /// the horizon before that is the atmosphere's own scattering, which
+    /// [`AtmosphereConfig`](crate::atmosphere::AtmosphereConfig) already
+    /// renders. Setting it short makes clear weather permanently hazy.
     pub max_visibility: f32,
 }
 
@@ -136,7 +142,7 @@ impl Default for FogConfig {
             sun_glow_exponent: 8.0,
             jitter: 0.0,
             min_visibility: 25.0,
-            max_visibility: 3_000.0,
+            max_visibility: 25_000.0,
         }
     }
 }
@@ -177,6 +183,26 @@ impl FogConfig {
     /// convention for "visibility".
     pub fn extinction_at(&self, density: f32) -> f32 {
         3.0 / self.visibility_at(density).max(1e-3)
+    }
+
+    /// Extinction per world unit that the *sky* should pick up from fog.
+    ///
+    /// This is [`extinction_at`](Self::extinction_at) with the clear-air floor
+    /// taken out, and the distinction matters more than it looks.
+    ///
+    /// `extinction_at` never returns zero -- it cannot, since it is three over
+    /// a finite visibility -- and the sky shader multiplies it by a path length
+    /// that runs away toward the horizon, where a ray skimming a shallow layer
+    /// travels through it almost indefinitely. Feed it the clear-air value and
+    /// the bottom of the sky is washed flat grey on a cloudless day: the band
+    /// where a sunset actually happens, painted over with a colour that has no
+    /// idea where the sun is.
+    ///
+    /// Subtracting the floor means no fog gives no wash, and the horizon haze
+    /// on a clear day is left to the atmosphere pass, which computes it from
+    /// real scattering and gets the colour right.
+    pub fn sky_extinction_at(&self, density: f32) -> f32 {
+        (self.extinction_at(density) - self.extinction_at(0.0)).max(0.0)
     }
 
     /// Fog colour for the current sun altitude and cloud cover.
