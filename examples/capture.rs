@@ -17,8 +17,16 @@
 //!   bright pixel is a star or something else.
 //! * `NO_ATMO=1` disables the atmosphere pass, which separates what this
 //!   plugin's own shaders produce from what the atmosphere then does to it.
+//! * `QUALITY=potato|low|medium|high|ultra` picks a quality tier, for
+//!   comparing what each one actually looks like.
 //! * `WB=<n>` overrides `MoonConfig::white_balance`, for checking how far the
 //!   moon's colour moves between no correction and full.
+//! * `FLICKER=1` replaces the shot list with a burst of consecutive frames of
+//!   one cloudy sky, for measuring temporal stability. Diffing neighbouring
+//!   frames is the only way to catch clouds that flicker: every frame on its
+//!   own looks perfectly reasonable.
+//! * `NO_FAST=1` disables `CloudConfig::adaptive_marching`, so the fast path
+//!   can be checked against the slow one for both looks and stability.
 
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::RenderTarget;
@@ -26,6 +34,7 @@ use bevy::image::Image;
 use bevy::prelude::*;
 use bevy::render::render_resource::TextureFormat;
 use bevy::render::view::screenshot::{Screenshot, save_to_disk};
+use bevy::time::TimeUpdateStrategy;
 use bevy::window::WindowResolution;
 
 use bevy_weather::prelude::*;
@@ -68,6 +77,26 @@ const fn at_phase(mut s: Shot, phase: f32) -> Shot {
 
 fn shots() -> Vec<Shot> {
     let fixed = |yaw: f32, pitch: f32| Aim::Fixed { yaw, pitch };
+
+    if std::env::var("FLICKER").is_ok() {
+        // The same sky over and over. Nothing changes between these shots
+        // except the clock ticking on, so any difference between neighbouring
+        // frames is the renderer being unstable rather than the weather moving.
+        return (0..16)
+            .map(|i| {
+                shot(
+                    Box::leak(format!("flicker-{i:02}").into_boxed_str()),
+                    12.0,
+                    WeatherPreset::PartlyCloudy,
+                    // Looking well up, where clouds fill the frame. Framed at
+                    // the horizon they occupy a thin band and an unstable
+                    // renderer can hide in it.
+                    fixed(0.35, 30.0),
+                )
+            })
+            .collect();
+    }
+
     vec![
         shot("01-dawn-clear", 6.2, WeatherPreset::Clear, fixed(0.35, 6.0)),
         shot(
@@ -226,7 +255,8 @@ fn main() {
                 ..default()
             },
             procedural: ProceduralWeather {
-                enabled: false,
+                enabled: std::env::var("FLICKER").is_ok(),
+                systems_per_day: 1.2,
                 ..default()
             },
             config: WeatherConfig {
@@ -236,6 +266,14 @@ fn main() {
             },
             ..default()
         })
+        // A fixed simulated time step. Without it every frame advances the
+        // world by however long the *previous* frame happened to take, so two
+        // runs of the same scene see different amounts of weather between
+        // captures -- and any frame-to-frame comparison is measuring the
+        // machine's mood as much as the renderer's stability.
+        .insert_resource(TimeUpdateStrategy::ManualDuration(
+            core::time::Duration::from_secs_f64(1.0 / 60.0),
+        ))
         .insert_resource(CaptureDirectory(directory))
         .add_systems(Startup, setup)
         .add_systems(Update, run_capture)
@@ -257,6 +295,8 @@ fn setup(
     mut moon: ResMut<MoonConfig>,
     mut stars: ResMut<StarConfig>,
     mut galaxy: ResMut<GalaxyConfig>,
+    mut clouds: ResMut<bevy_weather::clouds::CloudConfig>,
+    mut config: ResMut<WeatherConfig>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
@@ -268,6 +308,26 @@ fn setup(
     }
     if let Ok(v) = std::env::var("WB") {
         moon.white_balance = v.parse().unwrap_or(1.0);
+    }
+    if let Ok(q) = std::env::var("QUALITY") {
+        config.quality = match q.as_str() {
+            "potato" => Quality::Potato,
+            "low" => Quality::Low,
+            "high" => Quality::High,
+            "ultra" => Quality::Ultra,
+            _ => Quality::Medium,
+        };
+    }
+    if std::env::var("NO_FAST").is_ok() {
+        clouds.adaptive_marching = false;
+    }
+    if std::env::var("FREEZE").is_ok() {
+        // Nothing left that can legitimately change between frames: no wind to
+        // advect the field, no shape evolution, and the clock stopped. Any
+        // difference at all between consecutive frames is then the renderer
+        // itself being non-deterministic.
+        clouds.evolution_rate = 0.0;
+        clouds.wind_multiplier = 0.0;
     }
     if std::env::var("NO_STARS").is_ok() {
         stars.enabled = false;
@@ -331,8 +391,10 @@ fn run_capture(
     mut weather_time: ResMut<WeatherTime>,
     mut weather: ResMut<Weather>,
     mut cameras: Query<&mut Transform, With<CaptureCamera>>,
+    wind: Res<Wind>,
     mut exit: MessageWriter<AppExit>,
 ) {
+    let flicker = std::env::var("FLICKER").is_ok();
     let Some(&Shot {
         name,
         hour,
@@ -352,8 +414,29 @@ fn run_capture(
         return;
     };
 
+    if std::env::var("FREEZE").is_ok() {
+        weather.set_immediate(WeatherConditions {
+            wind_speed: 0.0,
+            ..WeatherPreset::PartlyCloudy.conditions()
+        });
+    }
+
+    if flicker {
+        // Deliberately not a frozen scene. The showcase runs its clock fast and
+        // leaves the procedural driver on, so the cloud layer's altitude,
+        // thickness and coverage are all being rewritten every frame. That is
+        // the state to test stability in; a paused one hides anything that only
+        // goes wrong while the weather is moving.
+        if std::env::var("FREEZE").is_err() {
+            weather_time.paused = false;
+            weather_time.day_length_secs = 180.0;
+        }
+    }
+
     if capture.frame == 0 {
-        weather_time.set_hour(hour);
+        if !flicker || capture.index == 0 {
+            weather_time.set_hour(hour);
+        }
         // Reset rather than leaving a previous shot's override in place.
         weather_time.moon_phase_offset = phase.unwrap_or(0.34);
         weather.set_immediate(preset);
@@ -374,15 +457,24 @@ fn run_capture(
             };
         }
         info!(
-            "capturing {name} at {hour:.1}h ({}), moon altitude {:.2}",
-            preset.name(),
+            "{name}: moon altitude {:.2}, wind {:.1} m/s, offset {:.1},{:.1}",
             sky.moon_altitude,
+            wind.speed(),
+            wind.offset.x,
+            wind.offset.y,
         );
     }
 
     capture.frame += 1;
 
-    let settle = SETTLE_FRAMES + if capture.index == 0 { WARMUP_FRAMES } else { 0 };
+    // In flicker mode, one shot per app frame: the whole point is to see what
+    // changes between frames the user actually sees, and leaving gaps measures
+    // the weather moving instead.
+    let settle = if flicker {
+        if capture.index == 0 { WARMUP_FRAMES } else { 0 }
+    } else {
+        SETTLE_FRAMES + if capture.index == 0 { WARMUP_FRAMES } else { 0 }
+    };
     if capture.frame >= settle && !capture.requested {
         capture.requested = true;
         let path = format!("{}/{}.png", capture.directory, name);
@@ -392,7 +484,8 @@ fn run_capture(
     }
 
     // Give the screenshot a few frames to make it to disk before moving on.
-    if capture.frame >= settle + 10 {
+    let hold = if flicker { 0 } else { 10 };
+    if capture.frame >= settle + hold {
         capture.index += 1;
         capture.frame = 0;
         capture.requested = false;

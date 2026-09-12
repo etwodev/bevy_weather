@@ -13,7 +13,7 @@
 use bevy::app::{App, Plugin, Startup, Update};
 use bevy::asset::RenderAssetUsages;
 use bevy::asset::{Asset, Assets, Handle, embedded_asset};
-use bevy::camera::visibility::NoFrustumCulling;
+use bevy::camera::visibility::{NoFrustumCulling, Visibility};
 use bevy::color::{Color, ColorToComponents};
 use bevy::ecs::component::Component;
 use bevy::ecs::resource::Resource;
@@ -34,7 +34,7 @@ use bevy::transform::components::Transform;
 
 use crate::WeatherSystems;
 use crate::celestial::CelestialBodies;
-use crate::config::WeatherConfig;
+use crate::config::{Quality, WeatherConfig};
 use crate::math::hash2_f32;
 use crate::state::Weather;
 use crate::wind::Wind;
@@ -59,6 +59,14 @@ pub enum PrecipitationKind {
 #[derive(Resource, Debug, Clone, Reflect)]
 #[reflect(Resource, Default)]
 pub struct PrecipitationConfig {
+    /// Pin this subsystem to its own quality tier, overriding
+    /// [`WeatherConfig::quality`](crate::config::WeatherConfig::quality).
+    ///
+    /// For a settings menu that exposes rain and snow density separately from everything
+    /// else. `None` follows the global dial. Explicit counts on this struct
+    /// still win over both.
+    pub quality: Option<Quality>,
+
     /// Particles in the pool. `None` follows
     /// [`WeatherConfig::quality`](crate::config::WeatherConfig::quality).
     ///
@@ -112,6 +120,7 @@ pub struct PrecipitationConfig {
 impl Default for PrecipitationConfig {
     fn default() -> Self {
         Self {
+            quality: None,
             particle_count: None,
             box_size: 60.0,
             rain_fall_speed: 22.0,
@@ -283,10 +292,7 @@ impl Plugin for PrecipitationPlugin {
 }
 
 fn particle_count(config: &WeatherConfig, precipitation: &PrecipitationConfig) -> u32 {
-    precipitation
-        .particle_count
-        .unwrap_or_else(|| config.quality.particle_count())
-        .clamp(1, 1_000_000)
+    precipitation.resolved_particle_count(config.quality)
 }
 
 fn spawn_precipitation(
@@ -348,7 +354,11 @@ fn rebuild_mesh(
 )]
 fn drive_precipitation(
     mut materials: ResMut<Assets<PrecipitationMaterial>>,
-    particles: Query<(&PrecipitationKind, &MeshMaterial3d<PrecipitationMaterial>)>,
+    mut particles: Query<(
+        &PrecipitationKind,
+        &MeshMaterial3d<PrecipitationMaterial>,
+        &mut Visibility,
+    )>,
     config: Res<WeatherConfig>,
     precipitation: Res<PrecipitationConfig>,
     weather: Res<Weather>,
@@ -359,11 +369,8 @@ fn drive_precipitation(
     let conditions = weather.current;
     let elapsed = time.elapsed_secs_wrapped();
 
-    for (kind, handle) in &particles {
-        let Some(mut material) = materials.get_mut(&handle.0) else {
-            continue;
-        };
-        material.uniform = build_uniform(
+    for (kind, handle, mut visibility) in &mut particles {
+        let uniform = build_uniform(
             *kind,
             &config,
             &precipitation,
@@ -372,6 +379,24 @@ fn drive_precipitation(
             &wind,
             elapsed,
         );
+
+        // Hide a field that is not falling. Both fields exist at all times so
+        // that rain and snow can overlap into sleet, but an idle one would
+        // otherwise still run its vertex shader over every quad in the pool
+        // every frame just to move them all off-screen -- and for most weather,
+        // one of the two is always idle.
+        let wanted = if uniform.params.y > 0.0 {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
+        if *visibility != wanted {
+            *visibility = wanted;
+        }
+
+        if let Some(mut material) = materials.get_mut(&handle.0) {
+            material.uniform = uniform;
+        }
     }
 }
 
@@ -443,6 +468,21 @@ pub fn build_uniform(
         ),
         tint: tint.to_linear().to_vec3().extend(1.0),
         light: lit.extend(precipitation.ambient.max(0.0)),
+    }
+}
+
+impl PrecipitationConfig {
+    /// The quality tier precipitation runs at, resolving
+    /// [`quality`](Self::quality) against the global dial.
+    pub fn quality(&self, global: Quality) -> Quality {
+        self.quality.unwrap_or(global)
+    }
+
+    /// Particles to allocate, resolving the explicit override, then the tier.
+    pub fn resolved_particle_count(&self, global: Quality) -> u32 {
+        self.particle_count
+            .unwrap_or_else(|| self.quality(global).particle_count())
+            .clamp(1, 1_000_000)
     }
 }
 
@@ -632,6 +672,18 @@ mod tests {
                 quality.particle_count()
             );
         }
+    }
+
+    #[test]
+    fn a_pinned_precipitation_tier_ignores_the_global_dial() {
+        let precipitation = PrecipitationConfig {
+            quality: Some(Quality::Ultra),
+            ..Default::default()
+        };
+        assert_eq!(
+            precipitation.resolved_particle_count(Quality::Potato),
+            Quality::Ultra.particle_count()
+        );
     }
 
     #[test]

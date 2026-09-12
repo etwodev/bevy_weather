@@ -25,7 +25,7 @@ use bevy::transform::components::{GlobalTransform, Transform};
 
 use crate::WeatherSystems;
 use crate::celestial::CelestialBodies;
-use crate::config::{WeatherCamera, WeatherConfig};
+use crate::config::{Quality, WeatherCamera, WeatherConfig};
 use crate::state::Weather;
 use crate::wind::Wind;
 use bevy::ecs::reflect::ReflectComponent;
@@ -36,6 +36,14 @@ use bevy::reflect::std_traits::ReflectDefault;
 #[derive(Resource, Debug, Clone, Reflect)]
 #[reflect(Resource, Default)]
 pub struct FogConfig {
+    /// Pin this subsystem to its own quality tier, overriding
+    /// [`WeatherConfig::quality`](crate::config::WeatherConfig::quality).
+    ///
+    /// For a settings menu that exposes fog separately from everything
+    /// else. `None` follows the global dial. Explicit counts on this struct
+    /// still win over both.
+    pub quality: Option<Quality>,
+
     /// Edge length of the fog volume, in world units. It follows the camera.
     ///
     /// Make this comfortably larger than the visibility distance you expect.
@@ -115,6 +123,7 @@ pub struct FogConfig {
 impl Default for FogConfig {
     fn default() -> Self {
         Self {
+            quality: None,
             volume_size: 700.0,
             volume_height: 30.0,
             volume_offset: -10.0,
@@ -133,6 +142,12 @@ impl Default for FogConfig {
 }
 
 impl FogConfig {
+    /// The quality tier the fog runs at, resolving [`quality`](Self::quality)
+    /// against the global dial.
+    pub fn quality(&self, global: Quality) -> Quality {
+        self.quality.unwrap_or(global)
+    }
+
     /// Total extinction coefficient handed to Bevy's fog volume.
     ///
     /// Pinned to the reciprocal of the volume size; see
@@ -235,7 +250,7 @@ fn configure_cameras(
 
         if config.volumetric_fog {
             entity_commands.insert(VolumetricFog {
-                step_count: config.quality.fog_steps(),
+                step_count: fog.quality(config.quality).fog_steps(),
                 jitter: fog.jitter,
                 ambient_color: color,
                 // See `FogConfig::max_optical_depth` for why this stays at zero.

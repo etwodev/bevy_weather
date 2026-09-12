@@ -54,6 +54,9 @@ struct SkyUniform {
     cloud_params2: vec4<f32>,
     // x: exposure. y: horizon fade. z: march steps. w: light steps.
     cloud_params3: vec4<f32>,
+    // x: distance where erosion starts fading, m. y: where it is gone, m.
+    // z, w: unused.
+    cloud_params4: vec4<f32>,
     cloud_albedo: vec4<f32>,
     // xyz: wind displacement, m. w: shape evolution, m.
     cloud_offset: vec4<f32>,
@@ -81,6 +84,7 @@ const FLAG_STARS: u32 = 1u;
 const FLAG_GALAXY: u32 = 2u;
 const FLAG_MOON: u32 = 4u;
 const FLAG_CLOUDS: u32 = 8u;
+const FLAG_ADAPTIVE_MARCH: u32 = 16u;
 
 const PI: f32 = 3.14159265359;
 const MAX_MARCH_DISTANCE: f32 = 160000.0;
@@ -148,6 +152,23 @@ fn hash21(p: vec2<f32>) -> f32 {
     return fract((q.x + q.y) * q.z);
 }
 
+/// Interleaved gradient noise, for offsetting the start of each ray.
+///
+/// A raymarch with a fixed start lays concentric rings across the sky wherever
+/// the step count is too low to resolve the cloud; offsetting each ray breaks
+/// those rings up. What it breaks them into is the question.
+///
+/// A plain hash scatters them into white noise, which at low step counts is a
+/// coarse, restless grain -- the eye picks it out immediately because nothing
+/// in a cloud looks like that. Interleaved gradient noise distributes the
+/// offsets over a small repeating lattice instead, so neighbouring pixels get
+/// complementary offsets and the error averages out over any few pixels rather
+/// than clumping. It reads as fine texture instead of dirt, and it costs three
+/// arithmetic operations.
+fn interleaved_gradient_noise(p: vec2<f32>) -> f32 {
+    return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715))));
+}
+
 fn hash23(p: vec2<f32>, salt: f32) -> vec3<f32> {
     return hash33(vec3(p, salt));
 }
@@ -174,35 +195,78 @@ fn value_noise3(p: vec3<f32>) -> f32 {
 }
 
 fn fbm3(p: vec3<f32>, octaves: i32) -> f32 {
+    return fbm3_lod(p, octaves, octaves, false);
+}
+
+/// fBm that may stop early, and may count the octaves it skipped at their
+/// maximum instead of evaluating them.
+///
+/// `computed` is how many octaves to actually sample. `bound` decides what
+/// happens to the rest: `false` simply renormalises over what was computed,
+/// giving a cheaper, blurrier estimate that is as likely to be high as low;
+/// `true` counts every skipped octave at the most it could possibly contribute,
+/// which makes the result a strict upper bound on the full-detail value.
+///
+/// That distinction is the whole point. A rejection test built on the blurry
+/// version is wrong: the two normalise over different totals, so the full
+/// evaluation can come out well above the estimate, and anything rejected on
+/// that basis is a hole punched in a cloud that should have been there. Since
+/// the field drifts with the wind, those holes drift too, and the sky flickers.
+/// An upper bound can only ever be too generous, so a "no" from it is always
+/// correct.
+fn fbm3_lod(p: vec3<f32>, octaves: i32, computed: i32, bound: bool) -> f32 {
     var sum = 0.0;
     var amplitude = 0.5;
     var total = 0.0;
     var q = p;
     for (var i = 0; i < octaves; i += 1) {
-        sum += value_noise3(q) * amplitude;
+        if i < computed {
+            sum += value_noise3(q) * amplitude;
+        } else if bound {
+            // The most this octave could have contributed.
+            sum += amplitude;
+        } else {
+            // Not counted at all, and left out of the normalisation too.
+            amplitude *= 0.5;
+            q = q * 2.03 + vec3(17.3, 5.1, 41.7);
+            continue;
+        }
         total += amplitude;
         amplitude *= 0.5;
         // Rotating between octaves hides the axis-aligned grid of the
         // underlying value noise.
         q = q * 2.03 + vec3(17.3, 5.1, 41.7);
     }
-    return sum / total;
+    return sum / max(total, 1e-6);
 }
 
 /// Ridged, billowy noise. Cloud tops are built from bulges, not from the
 /// smooth blobs plain fbm gives you.
 fn billow3(p: vec3<f32>, octaves: i32) -> f32 {
+    return billow3_lod(p, octaves, octaves, false);
+}
+
+/// [`fbm3_lod`] for the billowy variant. Same contract.
+fn billow3_lod(p: vec3<f32>, octaves: i32, computed: i32, bound: bool) -> f32 {
     var sum = 0.0;
     var amplitude = 0.5;
     var total = 0.0;
     var q = p;
     for (var i = 0; i < octaves; i += 1) {
-        sum += abs(value_noise3(q) * 2.0 - 1.0) * amplitude;
+        if i < computed {
+            sum += abs(value_noise3(q) * 2.0 - 1.0) * amplitude;
+        } else if bound {
+            sum += amplitude;
+        } else {
+            amplitude *= 0.5;
+            q = q * 2.11 + vec3(3.7, 29.1, 11.3);
+            continue;
+        }
         total += amplitude;
         amplitude *= 0.5;
         q = q * 2.11 + vec3(3.7, 29.1, 11.3);
     }
-    return sum / total;
+    return sum / max(total, 1e-6);
 }
 
 fn remap(x: f32, a: f32, b: f32, c: f32, d: f32) -> f32 {
@@ -437,14 +501,27 @@ struct CloudSample {
     height: f32,
 }
 
-fn cloud_density(position: vec3<f32>, planet: f32, detailed: bool) -> CloudSample {
+// How much of the cloud field to evaluate. The raymarch spends most of its
+// samples in empty air, so the cheapest level exists purely to answer "is there
+// anything here at all" without paying for the detail that only matters once
+// the answer is yes.
+//
+// `LOD_ESTIMATE` is an upper bound rather than an approximation, which is what
+// makes it safe to reject on. `LOD_LIGHT` is a plain low-detail approximation,
+// for the light march, where being unbiased matters more than being safe.
+const LOD_ESTIMATE: i32 = 0; // two octaves, remainder bounded; rejection only
+const LOD_LIGHT: i32 = 1;    // two octaves, renormalised
+const LOD_SHAPE: i32 = 2;    // three octaves, no erosion
+const LOD_FULL: i32 = 3;     // three octaves plus erosion
+
+fn cloud_density(position: vec3<f32>, planet: f32, lod: i32, detail_fade: f32) -> CloudSample {
     let base_altitude = sky.cloud_params0.z;
     let thickness = max(sky.cloud_params0.w, 1.0);
     let coverage = sky.cloud_params0.x;
     let density_scale = sky.cloud_params0.y;
     let shape_scale = max(sky.cloud_params1.x, 1.0);
     let detail_scale = max(sky.cloud_params1.y, 1.0);
-    let detail_strength = sky.cloud_params1.z;
+    let detail_strength = sky.cloud_params1.z * detail_fade;
 
     var out: CloudSample;
     out.density = 0.0;
@@ -484,21 +561,27 @@ fn cloud_density(position: vec3<f32>, planet: f32, detailed: bool) -> CloudSampl
     );
 
     // Two scales of base shape: broad systems, and the cells inside them.
-    let broad = fbm3(sample_point, 3);
-    let cells = billow3(sample_point * 3.7, 3);
+    let computed = select(2, 3, lod >= LOD_SHAPE);
+    let bound = lod == LOD_ESTIMATE;
+    let broad = fbm3_lod(sample_point, 3, computed, bound);
+    let cells = billow3_lod(sample_point * 3.7, 3, computed, bound);
     var shape = mix(broad, cells, 0.35);
 
     // Coverage is a threshold on the shape field, so raising it makes existing
     // clouds grow outward rather than making everything uniformly foggier.
     //
+    // No slack: at `LOD_ESTIMATE` the value above is already an upper bound, so
+    // this comparison is exactly conservative.
+    let threshold = 1.0 - coverage;
+    if shape <= threshold {
+        return out;
+    }
+
     // The upper edge tracks the threshold rather than sitting at 1.0. Fractal
     // noise clusters around its mean and almost never reaches its extremes, so
     // remapping to a fixed 1.0 would leave even a "solid" cloud at a fraction
     // of full density -- opaque cumulus would come out as haze.
-    shape = remap(shape, 1.0 - coverage, 1.0 - coverage * 0.4, 0.0, 1.0);
-    if shape <= 0.0 {
-        return out;
-    }
+    shape = remap(shape, threshold, 1.0 - coverage * 0.4, 0.0, 1.0);
 
     // Vertical profile: rounded at the bottom, anvil-flattened at the top. A
     // thick slab keeps its shoulders (cumulonimbus); a thin one is all base
@@ -512,7 +595,16 @@ fn cloud_density(position: vec3<f32>, planet: f32, detailed: bool) -> CloudSampl
         return out;
     }
 
-    if detailed && detail_strength > 0.0 {
+    // Erosion only ever removes density, and only near the edges: once the base
+    // shape is well clear of the threshold there is nothing left for it to bite
+    // into. Skipping it in the solid interior costs nothing visually and takes
+    // the most expensive part of the sample off the most common inside-cloud
+    // path.
+    // Erosion only ever removes density, and by less and less as the base shape
+    // approaches solid. The cutoff has to sit where the two sides agree, or it
+    // becomes another visible switch: at `shape = 0.7` skipping it is a twenty
+    // percent error, at `0.98` it is under one percent.
+    if lod >= LOD_FULL && detail_strength > 0.0 && shape < 0.98 {
         let detail_point = vec3(
             (position.x + sky.cloud_offset.x * 1.4) / detail_scale,
             altitude / detail_scale,
@@ -520,7 +612,7 @@ fn cloud_density(position: vec3<f32>, planet: f32, detailed: bool) -> CloudSampl
         );
         // Wispy at the edges, tighter lower down: erosion is strongest where
         // the cloud is already thin.
-        let erosion = mix(billow3(detail_point, 3), 1.0 - fbm3(detail_point * 2.3, 2), height);
+        let erosion = billow3(detail_point, 2);
         shape = remap(shape, erosion * detail_strength, 1.0, 0.0, 1.0);
     }
 
@@ -536,7 +628,7 @@ fn henyey_greenstein(cos_angle: f32, g: f32) -> f32 {
 }
 
 /// Optical depth from `position` toward the sun, by short-stepping outward.
-fn light_march(position: vec3<f32>, planet: f32, steps: i32) -> f32 {
+fn light_march(position: vec3<f32>, planet: f32, steps: i32, lod: i32) -> f32 {
     if steps <= 0 {
         return 0.0;
     }
@@ -550,7 +642,7 @@ fn light_march(position: vec3<f32>, planet: f32, steps: i32) -> f32 {
     for (var i = 0; i < steps; i += 1) {
         let step_size = base_step * (0.5 + f32(i));
         travelled += step_size;
-        let sample = cloud_density(position + sun * travelled, planet, false);
+        let sample = cloud_density(position + sun * travelled, planet, lod, 0.0);
         optical_depth += sample.density * step_size;
     }
     return optical_depth;
@@ -646,30 +738,140 @@ fn march_clouds(
     // once, below, along with the direct term.
     let ambient = vec3(ambient_strength * (SKY_RADIANCE * sun_up + 4.0));
 
+    let adaptive = (u32(sky.misc.w) & FLAG_ADAPTIVE_MARCH) != 0u;
+
     let span = far - near;
-    let step_size = span / f32(steps);
+    let fine_step = span / f32(steps);
+    // Empty air is most of the ray, and a sample there tells you nothing except
+    // that you should have skipped it. Stepping through it four times as fast
+    // and only dropping to the fine step once something is actually there is
+    // where nearly all the saving in this loop comes from.
+    // Quadruple steps, but never long enough to stride over the layer itself.
+    // Near the horizon the ray runs along the inside of the shell and the span
+    // is tens of kilometres, so `span / steps` is already larger than a cloud;
+    // quadrupling *that* means consecutive probes are uncorrelated and whether
+    // a cloud is found becomes a coin toss that lands differently every frame
+    // as the camera moves. Where the fine step is already coarse relative to
+    // the layer, this leaves it alone and skips nothing.
+    // Where cloud erosion stops being worth evaluating, in metres.
+    let detail_near = sky.cloud_params4.x;
+    let detail_far = sky.cloud_params4.y;
+
+    let coarse_limit = max(fine_step, thickness * 0.75);
+    let coarse_step = select(fine_step, min(fine_step * 4.0, coarse_limit), adaptive);
+    // Without the fast path, the probe *is* the sample: there is no cheap tier
+    // and nothing is skipped.
+    let probe_lod = select(LOD_FULL, LOD_ESTIMATE, adaptive);
+    let light_lod = select(LOD_SHAPE, LOD_LIGHT, adaptive);
+
     // Dithering the start breaks the raymarch into noise instead of the
     // concentric banding a fixed start gives.
-    let jitter = hash21(dither) * step_size;
+    let jitter = interleaved_gradient_noise(dither) * fine_step;
     var travelled = near + jitter;
+    var coarse = adaptive;
+    var empty_run = 0;
 
-    for (var i = 0; i < steps; i += 1) {
-        if result.transmittance < 0.01 {
+    // A ray that is entirely cloud takes `steps` fine steps; one that is
+    // entirely empty takes a quarter of that. The margin covers the extra
+    // sample spent each time the march backs up to re-enter a cloud, of which
+    // there is one per cloud along the ray. Running out mid-ray truncates the
+    // march and leaves a hard edge hanging in the sky, so the margin is
+    // generous -- an unused iteration costs nothing, a missing one is visible.
+    let max_iterations = steps + 48;
+
+    for (var i = 0; i < max_iterations; i += 1) {
+        if travelled >= far || result.transmittance < 0.01 {
             break;
         }
-        let position = origin + ray * travelled;
-        let sample = cloud_density(position, planet, true);
-        travelled += step_size;
 
-        if sample.density <= 0.001 {
+        let position = origin + ray * travelled;
+
+        // Erosion carves features a few hundred metres across. Ten kilometres
+        // out those are down to a pixel or two, and the aerial perspective has
+        // washed out what is left of them, so evaluating the noise that makes
+        // them is pure cost for no visible return.
+        //
+        // Faded rather than switched off at a threshold: a hard cutoff puts a
+        // ring in the sky at a fixed distance, and worse, that ring moves when
+        // the camera does.
+        let detail_fade = 1.0 - smoothstep(detail_near, detail_far, travelled);
+
+        // The cheap test. It is allowed to say "maybe" where the full
+        // evaluation would say "no", but never the other way round, so nothing
+        // can be skipped that should have been drawn.
+        let probe = cloud_density(position, planet, probe_lod, detail_fade);
+        if probe.density <= 0.0 {
+            travelled += select(fine_step, coarse_step, coarse);
+            // Several fine steps in a row with nothing in them means the cloud
+            // is behind us; go back to covering ground quickly.
+            if !coarse {
+                empty_run += 1;
+                if empty_run > 4 {
+                    coarse = true;
+                    empty_run = 0;
+                }
+            }
             continue;
         }
+
+        if coarse {
+            // Something is here, but a coarse step may have jumped most of the
+            // way through it. Back up to the last known-empty point and come
+            // in again at the fine step, so the cloud's leading edge is not
+            // quantised to the coarse grid.
+            travelled = max(travelled - coarse_step, near);
+            coarse = false;
+            empty_run = 0;
+            continue;
+        }
+
+        // When the fast path is off the probe was already a full sample, so
+        // there is nothing more to compute.
+        var sample = probe;
+        if adaptive {
+            sample = cloud_density(position, planet, LOD_FULL, detail_fade);
+        }
+
+        if sample.density <= 0.002 {
+            travelled += fine_step;
+            continue;
+        }
+
+        // Once the ray is half extinguished, everything behind that point is
+        // showing through less and less, so it does not need sampling as
+        // finely. Growing the step smoothly with accumulated opacity is safe
+        // where switching formulas is not: the analytic integration below is
+        // exact for any step length, so this changes how finely the cloud is
+        // sampled without changing how bright it comes out. And because the
+        // growth is continuous, there is no threshold for a drifting value to
+        // flip across.
+        //
+        // This is worth the most exactly where the cost is worst: a sky part
+        // way between clear and overcast, where rays neither miss the cloud nor
+        // terminate early in it.
+        let advance = fine_step * (1.0 + (1.0 - result.transmittance) * 3.0);
 
         let sigma = sample.density * extinction;
 
         var sun_transmittance = 1.0;
+        // One formula for the whole march, not two.
+        //
+        // Skipping the light march once the ray is mostly extinguished looks
+        // like free performance -- those samples contribute almost nothing. But
+        // the cheap stand-in below returns a *very* different value from the
+        // real march, and choosing between them on a hard threshold means a
+        // sample flips from one to the other the instant accumulated
+        // transmittance drifts across it. Every sample along the ray crosses at
+        // about the same time, so the whole cloud changes shading at once, and
+        // since the threshold sits right where the value is still drifting it
+        // flips back and forth: the sky visibly alternates between two
+        // different clouds.
+        //
+        // Any switch between two formulas has to be made where they agree, or
+        // it has to be blended. This one is neither, so it is gone.
         if light_steps > 0 {
-            sun_transmittance = exp(-light_march(position, planet, light_steps) * extinction);
+            sun_transmittance =
+                exp(-light_march(position, planet, light_steps, light_lod) * extinction);
         } else {
             // Cheap stand-in: assume the cloud above is as dense as here.
             let above = (1.0 - sample.height) * thickness;
@@ -698,7 +900,7 @@ fn march_clouds(
         // cancel out entirely. Leaving them in over-brightens the cloud by a
         // factor of `1 / extinction`, which is enough to make an overcast sky
         // come out whiter than a sunlit one.
-        let step_transmittance = exp(-sigma * step_size);
+        let step_transmittance = exp(-sigma * advance);
         let integrated = (source + inner_glow) * (1.0 - step_transmittance);
 
         result.scattering += result.transmittance * integrated;
@@ -709,6 +911,7 @@ fn march_clouds(
         result.mean_distance += travelled * contribution;
         distance_weight += contribution;
         result.transmittance *= step_transmittance;
+        travelled += advance;
     }
 
     // Fade the layer out as it approaches the horizon, where the slab
@@ -851,13 +1054,22 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     // altitude, a full sky by about -15.
     let night = 1.0 - smoothstep(-0.26, -0.05, sky.sun_direction.y);
 
-    if (flags & FLAG_GALAXY) != 0u {
-        color += galaxy(star_dir) * night;
+    // Skipping outright rather than computing and multiplying by zero. In
+    // daylight that is sixty-odd hashes a pixel saved for a result that was
+    // always going to be invisible.
+    if night > 0.002 {
+        if (flags & FLAG_GALAXY) != 0u {
+            color += galaxy(star_dir) * night;
+        }
+        if (flags & FLAG_STARS) != 0u {
+            color += star_field(star_dir, horizon_factor) * night;
+        }
     }
-    if (flags & FLAG_STARS) != 0u {
-        color += star_field(star_dir, horizon_factor) * night;
-    }
-    if (flags & FLAG_MOON) != 0u {
+    // The moon occupies a fraction of a degree, so the overwhelming majority of
+    // pixels are nowhere near it. One dot product rejects them before any of
+    // the surface noise is evaluated.
+    if (flags & FLAG_MOON) != 0u
+        && dot(ray, sky.moon_direction.xyz) > cos(sky.moon_direction.w * 18.0) {
         // A pale daytime moon against a blue sky is a real sight, so it keeps
         // a fraction of its brightness rather than vanishing at sunrise.
         color += moon(ray) * mix(0.12, 1.0, night);

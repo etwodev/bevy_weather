@@ -273,6 +273,99 @@ An interactive tour: fly around with `WASD` and the mouse, scrub the clock,
 cycle presets and climates, and toggle each subsystem. The on-screen panel lists
 the keys and shows the live weather state.
 
+### Building for Windows from macOS or Linux
+
+```bash
+rustup target add x86_64-pc-windows-gnu
+brew install mingw-w64          # or your distribution's mingw-w64 package
+cargo build --release --target x86_64-pc-windows-gnu --example showcase
+```
+
+`.cargo/config.toml` points the GNU target at the mingw linker. The MSVC target
+needs the Microsoft linker and Windows SDK, so it cannot be cross-compiled.
+
+The resulting `.exe` is self-contained — every shader is embedded in the binary,
+the examples load nothing from disk, and it links only against system DLLs.
+
+## Performance
+
+Frame time is always on screen in the showcase, and `B` runs a sweep that turns
+each subsystem on in turn and reports what it costs:
+
+```bash
+cargo run --release --example showcase -- --bench
+```
+
+Run it in release and **leave the window focused**. An unfocused window is
+pinned to the display refresh by the compositor, which flattens every
+measurement below 16.7 ms onto the same number — including measurements of
+configurations that are genuinely cheaper, which is how the problem gives itself
+away.
+
+Almost all the cost is the cloud raymarch, and it is per-pixel: it scales with
+resolution and with how much of the screen is sky, so looking straight up is the
+worst case.
+
+Cloud cost is not a single number. A clear sky skips the raymarch entirely, and
+a solid overcast deck extinguishes each ray within a few samples — the expensive
+case is the **broken sky in between**, where rays neither miss the cloud nor
+terminate early inside it. That is also exactly what you pass through whenever
+the weather changes, so a transition from clear to overcast costs more than
+either end of it. The benchmark measures the whole curve.
+
+### Quality tiers
+
+`Quality` is meant to be bound straight to a graphics menu. `Quality::ALL` gives
+you the entries in order and `Quality::name()` labels them:
+
+| Tier | Cloud steps | Light march | Erosion | Particles |
+|---|---|---|---|---|
+| `Potato` | 12 | — | off | 1 200 |
+| `Low` | 20 | — | on | 4 000 |
+| `Medium` | 36 | 3 | on | 12 000 |
+| `High` | 64 | 5 | on | 30 000 |
+| `Ultra` | 128 | 8 | on | 60 000 |
+
+Settings resolve in three levels, most specific first:
+
+1. **An explicit count** — `CloudConfig::steps = Some(48)`. Always wins.
+2. **A subsystem tier** — `CloudConfig::quality = Some(Quality::Low)`, for a menu
+   with separate sliders for clouds, precipitation, fog and sky.
+3. **The global tier** — `WeatherConfig::quality`.
+
+So the one-line version is `config.quality = Quality::Low`, and nothing you set
+by hand is ever overwritten.
+
+```rust,no_run
+# use bevy::prelude::*;
+# use bevy_weather::prelude::*;
+# use bevy_weather::clouds::CloudConfig;
+fn apply_graphics_settings(
+    mut config: ResMut<WeatherConfig>,
+    mut clouds: ResMut<CloudConfig>,
+    chosen: Quality,
+) {
+    config.quality = chosen;
+    // Or pin one subsystem, leaving the rest on the global dial:
+    clouds.quality = Some(Quality::High);
+}
+```
+
+In rough order of leverage:
+
+| Lever | |
+|---|---|
+| `WeatherConfig::quality` | One dial for everything; see the table above. |
+| `CloudConfig::steps` | The single biggest number in the plugin. |
+| `CloudConfig::light_steps` | `Some(0)` swaps the per-sample light march for an analytic approximation. Clouds lose some of their internal shadowing and get noticeably cheaper. |
+| `CloudConfig::detail_distance` | How far out erosion detail is still worth computing. Lower it to buy back time on a broken sky, where much of the screen is distant cloud near the horizon. |
+| `WeatherConfig::clouds` | Off is free. A clear sky already costs nothing — the raymarch is skipped when coverage is zero. |
+| `AtmosphereConfig::environment_map_size` | Regenerated every frame; 512 buys nothing over 128 for ambient light. |
+| `PrecipitationConfig::particle_count` | Fill-rate bound, so it also scales with `box_size`. |
+
+`CloudConfig::adaptive_marching` exists only so the fast path can be measured
+against the slow one — leave it on.
+
 ## License
 
 MIT OR Apache-2.0, at your option.

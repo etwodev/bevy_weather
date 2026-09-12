@@ -32,6 +32,14 @@ use bevy::reflect::std_traits::ReflectDefault;
 #[derive(Resource, Clone, Reflect)]
 #[reflect(Resource, Default)]
 pub struct AtmosphereConfig {
+    /// Pin this subsystem to its own quality tier, overriding
+    /// [`WeatherConfig::quality`](crate::config::WeatherConfig::quality).
+    ///
+    /// For a settings menu that exposes sky and atmosphere separately from everything
+    /// else. `None` follows the global dial. Explicit counts on this struct
+    /// still win over both.
+    pub quality: Option<Quality>,
+
     /// Spawn a planet entity with an Earth-like [`Atmosphere`] on startup.
     ///
     /// Turn this off if you want to spawn your own — a different planet radius,
@@ -53,8 +61,15 @@ pub struct AtmosphereConfig {
     /// Drive image-based ambient lighting and reflections from the sky.
     ///
     /// This is what stops objects going flat black in shadow, and what makes
-    /// them pick up the orange of a sunset. Costs a small amount per frame.
+    /// them pick up the orange of a sunset.
     pub environment_light: bool,
+
+    /// Edge length of that environment cubemap, or `None` to follow
+    /// [`WeatherConfig::quality`](crate::config::WeatherConfig::quality).
+    ///
+    /// Bevy regenerates it every frame and defaults to 512, which is far more
+    /// than low-frequency ambient light needs.
+    pub environment_map_size: Option<u32>,
 
     /// Set [`Exposure`] on weather cameras to this EV100.
     ///
@@ -83,10 +98,12 @@ pub struct AtmosphereConfig {
 impl Default for AtmosphereConfig {
     fn default() -> Self {
         Self {
+            quality: None,
             spawn_planet: true,
             density_multiplier: 1.0,
             raymarched: false,
             environment_light: true,
+            environment_map_size: None,
             exposure_ev100: Some(13.0),
             tonemapping: Some(Tonemapping::AcesFitted),
             bloom: Some(Bloom {
@@ -98,6 +115,14 @@ impl Default for AtmosphereConfig {
             }),
             aerial_view_max_distance: 32_000.0,
         }
+    }
+}
+
+impl AtmosphereConfig {
+    /// The quality tier the atmosphere runs at, resolving
+    /// [`quality`](Self::quality) against the global dial.
+    pub fn quality(&self, global: Quality) -> Quality {
+        self.quality.unwrap_or(global)
     }
 }
 
@@ -197,13 +222,21 @@ fn configure_cameras(
             aerial_view_lut_max_distance: atmosphere.aerial_view_max_distance,
             ..Default::default()
         };
-        apply_quality(&mut settings, config.quality);
+        apply_quality(&mut settings, atmosphere.quality(config.quality));
 
         let mut entity_commands = commands.entity(entity);
         entity_commands.insert(settings);
 
         if atmosphere.environment_light {
-            entity_commands.insert(AtmosphereEnvironmentMapLight::default());
+            let size = atmosphere
+                .environment_map_size
+                .unwrap_or_else(|| atmosphere.quality(config.quality).environment_map_size())
+                .clamp(16, 2048)
+                .next_power_of_two();
+            entity_commands.insert(AtmosphereEnvironmentMapLight {
+                size: bevy::math::UVec2::splat(size),
+                ..Default::default()
+            });
         } else {
             entity_commands.remove::<AtmosphereEnvironmentMapLight>();
         }
@@ -222,6 +255,18 @@ fn configure_cameras(
 fn apply_quality(settings: &mut AtmosphereSettings, quality: Quality) {
     use bevy::math::{UVec2, UVec3};
     match quality {
+        Quality::Potato => {
+            settings.transmittance_lut_size = UVec2::new(64, 32);
+            settings.transmittance_lut_samples = 20;
+            settings.multiscattering_lut_size = UVec2::new(16, 16);
+            settings.multiscattering_lut_dirs = 32;
+            settings.multiscattering_lut_samples = 10;
+            settings.sky_view_lut_size = UVec2::new(128, 64);
+            settings.sky_view_lut_samples = 6;
+            settings.aerial_view_lut_size = UVec3::new(16, 16, 8);
+            settings.aerial_view_lut_samples = 4;
+            settings.sky_max_samples = 6;
+        }
         Quality::Low => {
             settings.transmittance_lut_size = UVec2::new(128, 64);
             settings.sky_view_lut_size = UVec2::new(200, 100);

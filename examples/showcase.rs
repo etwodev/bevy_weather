@@ -6,51 +6,125 @@
 //!
 //! Fly around with the mouse and `WASD`. The on-screen panel lists the rest of
 //! the keys and shows the live weather state.
+//!
+//! # Measuring performance
+//!
+//! Frame time is always on display. `B` runs an automated sweep that turns the
+//! subsystems on one at a time and reports what each of them costs.
+//!
+//! Run it in release, full screen, and leave the window focused. macOS pins an
+//! unfocused window to the display refresh, which silently flattens every
+//! measurement below 16.7 ms onto the same number -- including measurements of
+//! configurations that are actually cheaper.
+//!
+//! ```sh
+//! cargo run --release --example showcase -- --bench
+//! ```
+//!
+//! runs the sweep on its own and exits with the table on stdout.
 
 use bevy::color::palettes::css;
 use bevy::input::mouse::AccumulatedMouseMotion;
 use bevy::prelude::*;
 use bevy::text::FontSize;
-use bevy::window::{CursorGrabMode, CursorOptions, PrimaryWindow};
+use bevy::window::{CursorGrabMode, CursorOptions, PresentMode, PrimaryWindow, WindowResolution};
 
+use bevy_weather::atmosphere::AtmosphereConfig;
+use bevy_weather::clouds::CloudConfig;
+use bevy_weather::precipitation::PrecipitationConfig;
 use bevy_weather::prelude::*;
+use std::collections::VecDeque;
 
 fn main() {
-    App::new()
-        .add_plugins(DefaultPlugins.set(WindowPlugin {
-            primary_window: Some(Window {
-                title: "bevy_weather showcase".into(),
-                ..default()
-            }),
-            ..default()
-        }))
-        .add_plugins(WeatherPlugin {
-            time: WeatherTime {
-                // A brisk cycle, so you can watch a whole day in a few minutes.
-                day_length_secs: 180.0,
-                latitude: 48.0,
-                ..default()
+    let auto_bench = std::env::args().any(|a| a == "--bench");
+
+    let mut app = App::new();
+    app.add_plugins(DefaultPlugins.set(WindowPlugin {
+        primary_window: Some(Window {
+            title: "bevy_weather showcase".into(),
+            // 720p, not something larger. Presenting a big window is itself
+            // expensive enough to swamp the differences being measured: at
+            // 1440p the empty scene alone costs more than every effect put
+            // together.
+            resolution: if auto_bench {
+                WindowResolution::new(1280, 720)
+            } else {
+                WindowResolution::default()
             },
-            procedural: ProceduralWeather {
-                climate: Climate::TEMPERATE,
-                systems_per_day: 1.2,
-                ..default()
+            present_mode: if auto_bench {
+                PresentMode::AutoNoVsync
+            } else {
+                PresentMode::default()
             },
             ..default()
-        })
-        .init_resource::<Tour>()
-        .add_systems(Startup, (setup_scene, setup_ui))
-        .add_systems(
-            Update,
-            (
-                fly_camera,
-                toggle_cursor,
-                weather_controls,
-                report_lightning,
-                update_ui,
-            ),
+        }),
+        ..default()
+    }))
+    .insert_resource(AutoBench(auto_bench))
+    .add_plugins(WeatherPlugin {
+        time: WeatherTime {
+            // A brisk cycle, so you can watch a whole day in a few minutes.
+            day_length_secs: 180.0,
+            latitude: 48.0,
+            ..default()
+        },
+        procedural: ProceduralWeather {
+            climate: Climate::TEMPERATE,
+            systems_per_day: 1.2,
+            ..default()
+        },
+        ..default()
+    })
+    .init_resource::<Tour>()
+    .init_resource::<FrameStats>()
+    .init_resource::<Benchmark>()
+    .add_systems(Startup, (setup_scene, setup_ui))
+    .add_systems(
+        Update,
+        (
+            track_frame_time,
+            start_auto_bench,
+            fly_camera,
+            toggle_cursor,
+            weather_controls,
+            run_benchmark,
+            report_lightning,
+            update_ui,
         )
-        .run();
+            .chain(),
+    );
+    app.run();
+}
+
+/// Whether this process was launched to benchmark and exit.
+#[derive(Resource)]
+struct AutoBench(bool);
+
+/// Kicks the sweep off on its own, once the renderer has settled.
+fn start_auto_bench(
+    auto: Res<AutoBench>,
+    bench: Res<Benchmark>,
+    mut frames: Local<usize>,
+    mut started: Local<bool>,
+    mut keys: ResMut<ButtonInput<KeyCode>>,
+    mut exit: MessageWriter<AppExit>,
+) {
+    if !auto.0 {
+        return;
+    }
+    *frames += 1;
+    if !*started {
+        if *frames > 30 {
+            // Simplest way in: press the key the user would press.
+            keys.press(KeyCode::KeyB);
+            *started = true;
+        }
+        return;
+    }
+    if !bench.running && bench.round >= Benchmark::ROUNDS {
+        println!("\n{}", bench.table());
+        exit.write(AppExit::Success);
+    }
 }
 
 /// Which preset and climate the manual controls are currently pointing at.
@@ -69,13 +143,6 @@ const CLIMATES: [(&str, Climate); 7] = [
     ("Mediterranean", Climate::MEDITERRANEAN),
     ("Polar", Climate::POLAR),
     ("Desert Nights", Climate::DESERT_NIGHTS),
-];
-
-const QUALITIES: [(&str, Quality); 4] = [
-    ("Low", Quality::Low),
-    ("Medium", Quality::Medium),
-    ("High", Quality::High),
-    ("Ultra", Quality::Ultra),
 ];
 
 #[derive(Component)]
@@ -305,9 +372,18 @@ fn weather_controls(
     }
 
     // ---- Rendering ---------------------------------------------------------
+    // The quality tiers, in order, so `G` walks up and `Shift+G` walks back
+    // down. This is the dial a game would put in its graphics menu.
     if keys.just_pressed(KeyCode::KeyG) {
-        tour.quality = (tour.quality + 1) % QUALITIES.len();
-        config.quality = QUALITIES[tour.quality].1;
+        config.quality = if keys.pressed(KeyCode::ShiftLeft) {
+            config.quality.lower()
+        } else {
+            config.quality.higher()
+        };
+        tour.quality = Quality::ALL
+            .iter()
+            .position(|q| *q == config.quality)
+            .unwrap_or(0);
     }
     if keys.just_pressed(KeyCode::Digit1) {
         config.clouds = !config.clouds;
@@ -341,7 +417,11 @@ fn report_lightning(mut strikes: MessageReader<LightningStrike>) {
 #[expect(clippy::too_many_arguments, reason = "an example's status panel")]
 fn update_ui(
     mut text: Query<&mut Text, With<StatusText>>,
+    stats: Res<FrameStats>,
+    bench: Res<Benchmark>,
     tour: Res<Tour>,
+    clouds: Res<CloudConfig>,
+    precipitation: Res<PrecipitationConfig>,
     weather_time: Res<WeatherTime>,
     weather: Res<Weather>,
     procedural: Res<ProceduralWeather>,
@@ -352,13 +432,34 @@ fn update_ui(
     let Ok(mut text) = text.single_mut() else {
         return;
     };
+
+    if bench.running {
+        let scenario = SCENARIOS
+            .get(bench.index)
+            .map(|s| s.name)
+            .unwrap_or("finishing");
+        text.0 = format!(
+            "benchmarking  {:.0}%   (round {} of {})\n\n  now measuring: {scenario}\n\n{}",
+            bench.progress() * 100.0,
+            bench.round + 1,
+            Benchmark::ROUNDS,
+            bench.table()
+        );
+        return;
+    }
     let now = weather.current;
     let hour = weather_time.hour();
     let phase_name = moon_phase_name(bodies.moon_phase);
 
+    let results = if bench.round >= Benchmark::ROUNDS {
+        format!("\n{}", bench.table())
+    } else {
+        String::new()
+    };
+
     text.0 = format!(
         "\
-bevy_weather showcase
+bevy_weather showcase   {frame:5.2} ms  ({fps:3.0} fps, {p95:5.2} ms p95)
 
   Day {day}, {h:02}:{m:02}   ({day_length:.0}s/day{paused})
   Sun altitude {sun:+.0} deg   daylight {daylight:.2}
@@ -366,7 +467,7 @@ bevy_weather showcase
 
   Mode        {mode}
   Climate     {climate}
-  Quality     {quality}
+  Quality     {quality}  ({cloud_steps} cloud steps, {light_steps} light, erosion {erosion}, {particles} particles)
 
   Cloud       cover {cover:.2}  density {density:.2}  base {base:.0} m  depth {depth:.0} m
   Rain {rain:.2}   Snow {snow:.2}   Fog {fog:.2}   Lightning {thunder:.1}/min
@@ -378,7 +479,16 @@ bevy_weather showcase
 
   Move        WASD / Q E   (Shift to sprint)   Esc grabs the mouse
   Time        Space pause   [ ] slower/faster   <- -> scrub   Up/Down +/- a day
-  Weather     N / M preset   P procedural   C climate   R reseed   G quality",
+  Weather     N / M preset   P procedural   C climate   R reseed
+  Quality     G steps up, Shift+G steps down
+  Measure     B benchmarks each subsystem in turn{results}",
+        frame = stats.median(),
+        fps = if stats.median() > 0.0 {
+            1000.0 / stats.median()
+        } else {
+            0.0
+        },
+        p95 = stats.p95(),
         day = weather_time.day,
         h = hour as u32,
         m = ((hour - hour.floor()) * 60.0) as u32,
@@ -395,7 +505,11 @@ bevy_weather showcase
             WeatherPreset::ALL[tour.preset].name()
         },
         climate = CLIMATES[tour.climate].0,
-        quality = QUALITIES[tour.quality].0,
+        quality = config.quality.name(),
+        cloud_steps = clouds.resolved_steps(config.quality),
+        light_steps = clouds.resolved_light_steps(config.quality),
+        erosion = on_off(config.quality.cloud_erosion()),
+        particles = precipitation.resolved_particle_count(config.quality),
         cover = now.cloud_coverage,
         density = now.cloud_density,
         base = now.cloud_altitude,
@@ -431,5 +545,363 @@ fn moon_phase_name(phase: f32) -> &'static str {
         5 => "waning gibbous",
         6 => "last quarter",
         _ => "waning crescent",
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Performance
+// ---------------------------------------------------------------------------
+
+/// A rolling window of recent frame times, in milliseconds.
+#[derive(Resource, Default)]
+struct FrameStats {
+    samples: VecDeque<f32>,
+}
+
+impl FrameStats {
+    /// About two seconds at sixty frames a second.
+    const CAPACITY: usize = 120;
+
+    fn push(&mut self, milliseconds: f32) {
+        if self.samples.len() == Self::CAPACITY {
+            self.samples.pop_front();
+        }
+        self.samples.push_back(milliseconds);
+    }
+
+    /// Median rather than mean: one stalled frame from a shader compile or a
+    /// window resize should not move the number everyone reads.
+    fn median(&self) -> f32 {
+        self.percentile(0.5)
+    }
+
+    /// The slow tail, which is what actually reads as stutter.
+    fn p95(&self) -> f32 {
+        self.percentile(0.95)
+    }
+
+    fn percentile(&self, fraction: f32) -> f32 {
+        if self.samples.is_empty() {
+            return 0.0;
+        }
+        let mut sorted: Vec<f32> = self.samples.iter().copied().collect();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal));
+        let index = ((sorted.len() - 1) as f32 * fraction).round() as usize;
+        sorted[index]
+    }
+}
+
+fn track_frame_time(mut stats: ResMut<FrameStats>, time: Res<Time>) {
+    let delta = time.delta_secs();
+    if delta > 0.0 {
+        stats.push(delta * 1000.0);
+    }
+}
+
+/// Everything a benchmark scenario is allowed to change.
+struct Knobs<'a> {
+    weather: &'a mut WeatherConfig,
+    atmosphere: &'a mut AtmosphereConfig,
+    precipitation: &'a mut PrecipitationConfig,
+    clouds: &'a mut CloudConfig,
+    conditions: &'a mut Weather,
+}
+
+struct Scenario {
+    name: &'static str,
+    apply: fn(&mut Knobs),
+}
+
+/// Each scenario sets the flags *absolutely* rather than toggling one more
+/// thing on. That is what lets the sweep visit them round-robin, which is what
+/// makes the numbers trustworthy: a scenario measured once, in order, picks up
+/// whatever the machine happened to be doing at that moment and there is no way
+/// to tell. Measured repeatedly and interleaved, that contamination shows up as
+/// spread and can be discarded.
+const SCENARIOS: &[Scenario] = &[
+    Scenario {
+        name: "scene only",
+        apply: |k| set(k, false, false, false, false, false, false),
+    },
+    Scenario {
+        name: "+ atmosphere",
+        apply: |k| set(k, true, false, false, false, false, false),
+    },
+    Scenario {
+        name: "+ sky lighting",
+        apply: |k| set(k, true, true, false, false, false, false),
+    },
+    Scenario {
+        name: "+ stars, galaxy, moon",
+        apply: |k| set(k, true, true, true, false, false, false),
+    },
+    Scenario {
+        name: "clouds, no fast path",
+        apply: |k| {
+            set(k, true, true, true, true, false, false);
+            k.clouds.adaptive_marching = false;
+        },
+    },
+    Scenario {
+        name: "+ clouds",
+        apply: |k| set(k, true, true, true, true, false, false),
+    },
+    Scenario {
+        name: "+ rain and snow",
+        apply: |k| set(k, true, true, true, true, true, false),
+    },
+    // Cloud cost is not one number. A clear sky skips the raymarch outright and
+    // a solid deck extinguishes each ray almost immediately; the expensive case
+    // is the broken sky in between, where rays neither miss the cloud nor
+    // terminate early in it. That is also what you fly through on the way from
+    // one to the other.
+    Scenario {
+        name: "cloud cover 25%",
+        apply: |k| with_coverage(k, 0.25),
+    },
+    Scenario {
+        name: "cloud cover 50%",
+        apply: |k| with_coverage(k, 0.50),
+    },
+    Scenario {
+        name: "cloud cover 75%",
+        apply: |k| with_coverage(k, 0.75),
+    },
+    Scenario {
+        name: "cloud cover 100%",
+        apply: |k| with_coverage(k, 1.00),
+    },
+    Scenario {
+        name: "+ fog",
+        apply: |k| set(k, true, true, true, true, true, true),
+    },
+];
+
+/// Clouds at a fixed coverage, with everything else on.
+fn with_coverage(k: &mut Knobs, amount: f32) {
+    set(k, true, true, true, true, false, false);
+    let mut conditions = WeatherPreset::PartlyCloudy.conditions();
+    conditions.cloud_coverage = amount;
+    conditions.cloud_density = 0.7;
+    k.conditions.set_immediate(conditions);
+}
+
+#[expect(
+    clippy::fn_params_excessive_bools,
+    reason = "a flag table, read by position"
+)]
+fn set(
+    k: &mut Knobs,
+    atmosphere: bool,
+    sky_lighting: bool,
+    sky: bool,
+    clouds: bool,
+    precipitation: bool,
+    fog: bool,
+) {
+    k.weather.atmosphere = atmosphere;
+    k.atmosphere.environment_light = sky_lighting;
+    k.weather.sky = sky;
+    k.weather.clouds = clouds;
+    k.weather.precipitation = precipitation;
+    k.weather.distance_fog = fog;
+    k.weather.volumetric_fog = fog;
+    k.precipitation.particle_count = None;
+    k.clouds.adaptive_marching = true;
+}
+
+/// What the benchmark borrowed and has to give back.
+struct SavedState {
+    weather: WeatherConfig,
+    atmosphere: AtmosphereConfig,
+    precipitation: PrecipitationConfig,
+    clouds: CloudConfig,
+    conditions: WeatherConditions,
+    procedural: bool,
+    paused: bool,
+    time_of_day: f32,
+    camera: Transform,
+}
+
+#[derive(Resource, Default)]
+struct Benchmark {
+    running: bool,
+    round: usize,
+    index: usize,
+    frame: usize,
+    /// Every frame time collected for each scenario, across all rounds.
+    samples: Vec<Vec<f32>>,
+    saved: Option<Box<SavedState>>,
+}
+
+impl Benchmark {
+    /// Passes over the whole scenario list.
+    const ROUNDS: usize = 3;
+    /// Frames to discard after switching scenario, while pipelines compile and
+    /// the atmosphere's lookup tables catch up.
+    const WARMUP: usize = 20;
+    /// Frames to time per scenario per round.
+    const SAMPLES: usize = 20;
+
+    fn begin(&mut self) {
+        self.running = true;
+        self.round = 0;
+        self.index = 0;
+        self.frame = 0;
+        self.samples = vec![Vec::new(); SCENARIOS.len()];
+    }
+
+    fn progress(&self) -> f32 {
+        let total = (Self::ROUNDS * SCENARIOS.len()) as f32;
+        let done = (self.round * SCENARIOS.len() + self.index) as f32;
+        (done / total).clamp(0.0, 1.0)
+    }
+
+    /// The low percentile of everything collected for a scenario.
+    ///
+    /// Not the median. Every source of error here is one-directional: a
+    /// compositor throttle, a background process, a shader recompile can only
+    /// ever make a frame slower than the work in it warrants, never faster. The
+    /// fastest frames are the honest ones, so the bottom of the distribution is
+    /// the estimate and the spread above it is contamination.
+    fn cost(&self, index: usize) -> f32 {
+        let samples = match self.samples.get(index) {
+            Some(s) if !s.is_empty() => s,
+            _ => return 0.0,
+        };
+        let mut sorted = samples.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal));
+        sorted[sorted.len() / 10]
+    }
+
+    fn table(&self) -> String {
+        let mut out = String::from(
+            "  scenario                  fastest    delta
+",
+        );
+        let mut previous = 0.0;
+        for (index, scenario) in SCENARIOS.iter().enumerate() {
+            let cost = self.cost(index);
+            if cost == 0.0 {
+                continue;
+            }
+            let name = scenario.name;
+            if previous == 0.0 {
+                out.push_str(&format!(
+                    "  {name:<24} {cost:6.2} ms        -
+"
+                ));
+            } else {
+                out.push_str(&format!(
+                    "  {name:<24} {cost:6.2} ms  {:+6.2} ms
+",
+                    cost - previous
+                ));
+            }
+            previous = cost;
+        }
+        out
+    }
+}
+
+#[expect(clippy::too_many_arguments, reason = "the benchmark's knob box")]
+fn run_benchmark(
+    keys: Res<ButtonInput<KeyCode>>,
+    mut bench: ResMut<Benchmark>,
+    mut config: ResMut<WeatherConfig>,
+    mut atmosphere: ResMut<AtmosphereConfig>,
+    mut precipitation: ResMut<PrecipitationConfig>,
+    mut cloud_config: ResMut<CloudConfig>,
+    mut weather: ResMut<Weather>,
+    mut procedural: ResMut<ProceduralWeather>,
+    mut weather_time: ResMut<WeatherTime>,
+    mut cameras: Query<&mut Transform, With<FlyCamera>>,
+    time: Res<Time>,
+) {
+    if keys.just_pressed(KeyCode::KeyB) && !bench.running {
+        let Ok(camera) = cameras.single() else {
+            return;
+        };
+        bench.saved = Some(Box::new(SavedState {
+            weather: config.clone(),
+            atmosphere: atmosphere.clone(),
+            precipitation: precipitation.clone(),
+            clouds: cloud_config.clone(),
+            conditions: weather.target,
+            procedural: procedural.enabled,
+            paused: weather_time.paused,
+            time_of_day: weather_time.time_of_day,
+            camera: *camera,
+        }));
+
+        // Pin everything the benchmark depends on, so two runs are comparable:
+        // fixed weather, a stopped clock, and the camera looking at the sky,
+        // which is where all the expensive pixels are.
+        bench.begin();
+        procedural.enabled = false;
+        weather.set_immediate(WeatherPreset::Rain);
+        weather_time.paused = true;
+        weather_time.time_of_day = 0.62;
+        for mut transform in &mut cameras {
+            *transform = Transform::from_xyz(0.0, 4.0, 40.0).with_rotation(Quat::from_euler(
+                EulerRot::YXZ,
+                0.35,
+                0.45,
+                0.0,
+            ));
+        }
+        info!("benchmark started");
+    }
+
+    if !bench.running {
+        return;
+    }
+
+    if bench.round >= Benchmark::ROUNDS {
+        // Done: hand everything back.
+        if let Some(saved) = bench.saved.take() {
+            *config = saved.weather;
+            *atmosphere = saved.atmosphere;
+            *precipitation = saved.precipitation;
+            *cloud_config = saved.clouds;
+            weather.set_immediate(saved.conditions);
+            procedural.enabled = saved.procedural;
+            weather_time.paused = saved.paused;
+            weather_time.time_of_day = saved.time_of_day;
+            for mut transform in &mut cameras {
+                *transform = saved.camera;
+            }
+        }
+        bench.running = false;
+        info!("benchmark finished\n{}", bench.table());
+        return;
+    }
+
+    if bench.frame == 0 {
+        (SCENARIOS[bench.index].apply)(&mut Knobs {
+            weather: &mut config,
+            atmosphere: &mut atmosphere,
+            precipitation: &mut precipitation,
+            clouds: &mut cloud_config,
+            conditions: &mut weather,
+        });
+    }
+
+    bench.frame += 1;
+    if bench.frame > Benchmark::WARMUP {
+        let delta = time.delta_secs();
+        if delta > 0.0 {
+            let index = bench.index;
+            bench.samples[index].push(delta * 1000.0);
+        }
+    }
+
+    if bench.frame >= Benchmark::WARMUP + Benchmark::SAMPLES {
+        bench.frame = 0;
+        bench.index += 1;
+        if bench.index >= SCENARIOS.len() {
+            bench.index = 0;
+            bench.round += 1;
+        }
     }
 }

@@ -35,8 +35,17 @@ pub struct Wind {
     pub offset: Vec2,
     /// Seed for the gust noise.
     pub seed: u32,
-    /// Wraps [`offset`](Self::offset) at this many metres to keep shader-side
-    /// `f32` precision usable during very long sessions.
+    /// Magnitude at which [`offset`](Self::offset) folds back toward zero, in
+    /// world units, to keep shader-side `f32` precision usable over a long
+    /// session.
+    ///
+    /// Folding is visible for one frame when it happens — the cloud field
+    /// shifts — so this wants to be large enough that it happens rarely. At the
+    /// default and a stiff breeze it is once every few hours.
+    ///
+    /// It also wants to be small enough that a single frame's wind movement is
+    /// comfortably larger than the floating-point spacing there; see
+    /// [`advance_offset`].
     pub offset_wrap: f32,
 }
 
@@ -48,7 +57,7 @@ impl Default for Wind {
             gust: 1.0,
             offset: Vec2::ZERO,
             seed: 0x5EED_1234,
-            offset_wrap: 1.0e6,
+            offset_wrap: 1.0e5,
         }
     }
 }
@@ -115,8 +124,48 @@ fn update_wind(mut wind: ResMut<Wind>, weather: Res<Weather>, time: Res<Time>) {
     wind.velocity = wind.base_velocity * wind.gust;
 
     let wrap = wind.offset_wrap.max(1.0);
-    let offset = wind.offset + wind.velocity * time.delta_secs();
-    wind.offset = Vec2::new(offset.x.rem_euclid(wrap), offset.y.rem_euclid(wrap));
+    wind.offset = advance_offset(wind.offset, wind.velocity, time.delta_secs(), wrap);
+}
+
+/// Integrates the wind displacement and folds it back toward zero.
+///
+/// # Why this is not `rem_euclid`
+///
+/// `rem_euclid` maps its result into `[0, wrap)`, which parks the value hard
+/// against the boundary whenever the wind runs backwards: a displacement of
+/// `-0.05` comes back as `wrap - 0.05`.
+///
+/// At a large wrap that is where floating point runs out. The spacing between
+/// representable `f32` values near `1e6` is `0.0625`, and a single frame of
+/// wind moves less than that, so `wrap - 0.05` rounds to exactly `wrap` — and
+/// `wrap.rem_euclid(wrap)` is `0`. The next frame goes negative again and comes
+/// back to `wrap`. The offset then alternates between `0` and `wrap` forever,
+/// every single frame.
+///
+/// That offset is what the cloud shader advects its noise field by, so the
+/// clouds alternate between two completely unrelated skies at frame rate. It
+/// reads as violent flashing, and it is worst in light winds — precisely when
+/// the sky should be calmest.
+///
+/// A signed remainder has no such boundary. Values near zero are left exactly
+/// alone, and folding only happens after a full period has genuinely been
+/// travelled, which lands the result near zero rather than on the edge.
+pub fn advance_offset(offset: Vec2, velocity: Vec2, delta: f32, wrap: f32) -> Vec2 {
+    let wrap = wrap.max(1.0);
+    let moved = offset + velocity * delta;
+    Vec2::new(fold(moved.x, wrap), fold(moved.y, wrap))
+}
+
+/// Folds `value` into `(-wrap, wrap)`, leaving anything already inside untouched.
+#[inline]
+fn fold(value: f32, wrap: f32) -> f32 {
+    if value.is_finite() && value.abs() >= wrap {
+        value % wrap
+    } else if value.is_finite() {
+        value
+    } else {
+        0.0
+    }
 }
 
 #[cfg(test)]
@@ -143,6 +192,71 @@ mod tests {
             let b = i as f32 / 64.0 * core::f32::consts::TAU;
             assert!((bearing_to_vec2(b).length() - 1.0).abs() < 1e-6);
         }
+    }
+
+    #[test]
+    fn a_backwards_wind_does_not_make_the_offset_oscillate() {
+        // The bug this guards against: with `rem_euclid`, an offset sitting at
+        // zero and a wind blowing in the negative direction lands just below
+        // zero, comes back as `wrap`, and then rounds straight back to zero --
+        // alternating every frame. The cloud field is advected by this, so the
+        // sky flashes between two unrelated skies at frame rate.
+        let wrap = 1.0e5;
+        let velocity = Vec2::new(-3.0, -0.04);
+        let mut offset = Vec2::ZERO;
+        for frame in 0..600 {
+            let next = advance_offset(offset, velocity, 1.0 / 60.0, wrap);
+            let jump = (next - offset).length();
+            assert!(
+                jump < 1.0,
+                "frame {frame}: offset jumped {jump} ({offset:?} -> {next:?})"
+            );
+            offset = next;
+        }
+    }
+
+    #[test]
+    fn the_offset_stays_bounded() {
+        let wrap = 1.0e5;
+        let mut offset = Vec2::ZERO;
+        for _ in 0..20_000 {
+            offset = advance_offset(offset, Vec2::new(40.0, -25.0), 1.0, wrap);
+            assert!(offset.x.abs() < wrap && offset.y.abs() < wrap, "{offset:?}");
+        }
+    }
+
+    #[test]
+    fn small_offsets_are_left_exactly_alone() {
+        // Nothing near zero should ever be rewritten; that is what kept
+        // dragging the value onto the boundary.
+        let wrap = 1.0e5;
+        for value in [0.0f32, -1e-9, 1e-9, -0.05, 0.05, -500.0, 500.0] {
+            let moved = advance_offset(Vec2::new(value, value), Vec2::ZERO, 1.0 / 60.0, wrap);
+            assert_eq!(moved.x, value, "{value} was rewritten");
+        }
+    }
+
+    #[test]
+    fn folding_survives_a_wrap_crossing_without_a_second_jump() {
+        // One discontinuity when it folds, and then it must settle rather than
+        // bouncing off the boundary.
+        let wrap = 1.0e3;
+        let mut offset = Vec2::new(wrap - 0.5, 0.0);
+        let mut jumps = 0;
+        for _ in 0..400 {
+            let next = advance_offset(offset, Vec2::new(6.0, 0.0), 1.0 / 60.0, wrap);
+            if (next.x - offset.x).abs() > 1.0 {
+                jumps += 1;
+            }
+            offset = next;
+        }
+        assert_eq!(jumps, 1, "expected exactly one fold, got {jumps}");
+    }
+
+    #[test]
+    fn non_finite_velocity_cannot_poison_the_offset() {
+        let moved = advance_offset(Vec2::ZERO, Vec2::splat(f32::INFINITY), 1.0, 1.0e5);
+        assert!(moved.x.is_finite() && moved.y.is_finite(), "{moved:?}");
     }
 
     #[test]

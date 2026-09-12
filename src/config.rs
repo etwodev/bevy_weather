@@ -18,31 +18,93 @@ use bevy::reflect::std_traits::ReflectDefault;
 #[reflect(Component, Default)]
 pub struct WeatherCamera;
 
-/// A coarse quality dial that picks sample counts for the expensive effects.
+/// A quality tier, ready to be a dropdown in a settings menu.
 ///
-/// Every individual count is still overridable on the specific config struct;
-/// this only sets the defaults.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Reflect)]
+/// Use [`ALL`](Self::ALL) to populate the menu and [`name`](Self::name) to label
+/// the entries. Setting [`WeatherConfig::quality`] moves every subsystem at
+/// once; each subsystem can then be pinned to its own tier, and any individual
+/// count can still be set outright. See [`WeatherConfig::quality`] for how the
+/// three levels resolve against each other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Reflect)]
 pub enum Quality {
-    /// Cheap enough for integrated GPUs. Few cloud samples, no light march.
+    /// Whatever it takes. Clouds lose their erosion detail and their light
+    /// march, so they read as soft blobs rather than sculpted cumulus, and
+    /// precipitation thins right out. For hardware that cannot manage [`Low`].
+    ///
+    /// [`Low`]: Self::Low
+    Potato,
+    /// Cheap enough for integrated graphics. Clouds keep their shape but lose
+    /// self-shadowing.
     Low,
     /// Sensible default.
     #[default]
     Medium,
-    /// Doubles cloud raymarch steps and particle counts.
+    /// Roughly double the cloud samples, and the light march that gives them
+    /// their internal shadowing.
     High,
     /// For screenshots and cutscenes.
     Ultra,
 }
 
 impl Quality {
+    /// Every tier, cheapest first. Suitable for driving a settings dropdown.
+    pub const ALL: [Quality; 5] = [
+        Quality::Potato,
+        Quality::Low,
+        Quality::Medium,
+        Quality::High,
+        Quality::Ultra,
+    ];
+
+    /// Human-readable name, for a settings menu.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Quality::Potato => "Potato",
+            Quality::Low => "Low",
+            Quality::Medium => "Medium",
+            Quality::High => "High",
+            Quality::Ultra => "Ultra",
+        }
+    }
+
+    /// The next tier up, saturating at [`Ultra`](Self::Ultra).
+    pub fn higher(self) -> Quality {
+        Quality::ALL
+            .get(Quality::ALL.iter().position(|q| *q == self).unwrap_or(0) + 1)
+            .copied()
+            .unwrap_or(Quality::Ultra)
+    }
+
+    /// The next tier down, saturating at [`Potato`](Self::Potato).
+    pub fn lower(self) -> Quality {
+        let index = Quality::ALL.iter().position(|q| *q == self).unwrap_or(0);
+        Quality::ALL
+            .get(index.saturating_sub(1))
+            .copied()
+            .unwrap_or(Quality::Potato)
+    }
+
+    /// Whether clouds get their fine erosion detail.
+    ///
+    /// This is the noise that eats away at cloud edges and gives them their
+    /// wispy, torn look. It is the single most expensive part of a cloud
+    /// sample, and the first thing to go.
+    pub const fn cloud_erosion(self) -> bool {
+        !matches!(self, Quality::Potato)
+    }
+
     /// Primary raymarch steps through the cloud layer.
+    ///
+    /// The most expensive number in the plugin, and the one to reach for first.
+    /// Cost is per-pixel, so it is felt hardest looking straight up, where the
+    /// cloud layer fills the frame.
     pub fn cloud_steps(self) -> u32 {
         match self {
-            Quality::Low => 24,
-            Quality::Medium => 48,
-            Quality::High => 96,
-            Quality::Ultra => 160,
+            Quality::Potato => 12,
+            Quality::Low => 20,
+            Quality::Medium => 36,
+            Quality::High => 64,
+            Quality::Ultra => 128,
         }
     }
 
@@ -50,9 +112,10 @@ impl Quality {
     /// Zero means "use the cheap analytic approximation instead".
     pub fn cloud_light_steps(self) -> u32 {
         match self {
+            Quality::Potato => 0,
             Quality::Low => 0,
-            Quality::Medium => 4,
-            Quality::High => 6,
+            Quality::Medium => 3,
+            Quality::High => 5,
             Quality::Ultra => 8,
         }
     }
@@ -60,6 +123,7 @@ impl Quality {
     /// Number of precipitation particles at full intensity.
     pub fn particle_count(self) -> u32 {
         match self {
+            Quality::Potato => 1_200,
             Quality::Low => 4_000,
             Quality::Medium => 12_000,
             Quality::High => 30_000,
@@ -67,9 +131,24 @@ impl Quality {
         }
     }
 
+    /// Edge length of the cubemap the atmosphere generates for ambient light.
+    ///
+    /// Regenerated every frame, so it is not free. It only carries low-frequency
+    /// ambient and reflection, and 512 buys nothing visible over 256 for that.
+    pub fn environment_map_size(self) -> u32 {
+        match self {
+            Quality::Potato => 32,
+            Quality::Low => 64,
+            Quality::Medium => 128,
+            Quality::High => 256,
+            Quality::Ultra => 512,
+        }
+    }
+
     /// Raymarch steps for Bevy's volumetric fog.
     pub fn fog_steps(self) -> u32 {
         match self {
+            Quality::Potato => 12,
             Quality::Low => 24,
             Quality::Medium => 48,
             Quality::High => 80,
@@ -85,8 +164,20 @@ impl Quality {
 #[derive(Resource, Debug, Clone, Reflect)]
 #[reflect(Resource, Default)]
 pub struct WeatherConfig {
-    /// Global quality dial. Changing this does *not* retroactively overwrite
-    /// counts you set by hand on the individual config resources.
+    /// Global quality dial: the one a game's graphics menu should be bound to.
+    ///
+    /// Settings resolve in three levels, most specific first:
+    ///
+    /// 1. An explicit count, like [`CloudConfig::steps`]. Always wins.
+    /// 2. That subsystem's own tier, like [`CloudConfig::quality`], for a menu
+    ///    with separate sliders for clouds and precipitation.
+    /// 3. This, the global tier.
+    ///
+    /// So changing this moves everything that has not been pinned, and never
+    /// overwrites a number you set by hand.
+    ///
+    /// [`CloudConfig::steps`]: crate::clouds::CloudConfig::steps
+    /// [`CloudConfig::quality`]: crate::clouds::CloudConfig::quality
     pub quality: Quality,
 
     /// Render the physically-based atmosphere (sky colour, aerial perspective).
@@ -133,6 +224,86 @@ impl Default for WeatherConfig {
             celestial_lights: true,
             light_intensity_scale: 1.0,
             units_per_meter: 1.0,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_tier_is_listed_once_and_in_order() {
+        assert_eq!(Quality::ALL.len(), 5);
+        for pair in Quality::ALL.windows(2) {
+            assert!(
+                pair[0] < pair[1],
+                "{:?} should precede {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+
+    #[test]
+    fn costs_rise_with_the_tier() {
+        for pair in Quality::ALL.windows(2) {
+            let (cheap, dear) = (pair[0], pair[1]);
+            assert!(cheap.cloud_steps() <= dear.cloud_steps());
+            assert!(cheap.cloud_light_steps() <= dear.cloud_light_steps());
+            assert!(cheap.particle_count() <= dear.particle_count());
+            assert!(cheap.fog_steps() <= dear.fog_steps());
+            assert!(cheap.environment_map_size() <= dear.environment_map_size());
+        }
+    }
+
+    #[test]
+    fn every_tier_still_draws_something() {
+        // A tier that renders nothing is a bug, not a fast setting.
+        for quality in Quality::ALL {
+            assert!(quality.cloud_steps() >= 8, "{}", quality.name());
+            assert!(quality.particle_count() >= 500, "{}", quality.name());
+            assert!(quality.environment_map_size() >= 16, "{}", quality.name());
+        }
+    }
+
+    #[test]
+    fn only_the_cheapest_tier_drops_cloud_detail() {
+        assert!(!Quality::Potato.cloud_erosion());
+        for quality in [Quality::Low, Quality::Medium, Quality::High, Quality::Ultra] {
+            assert!(quality.cloud_erosion(), "{}", quality.name());
+        }
+    }
+
+    #[test]
+    fn stepping_through_the_tiers_saturates_at_both_ends() {
+        assert_eq!(Quality::Potato.lower(), Quality::Potato);
+        assert_eq!(Quality::Ultra.higher(), Quality::Ultra);
+        assert_eq!(Quality::Medium.higher(), Quality::High);
+        assert_eq!(Quality::Medium.lower(), Quality::Low);
+
+        // Walking all the way up and back lands where it started.
+        let mut quality = Quality::Potato;
+        for _ in 0..10 {
+            quality = quality.higher();
+        }
+        assert_eq!(quality, Quality::Ultra);
+        for _ in 0..10 {
+            quality = quality.lower();
+        }
+        assert_eq!(quality, Quality::Potato);
+    }
+
+    #[test]
+    fn every_tier_has_a_distinct_name() {
+        let mut seen: Vec<&str> = Vec::new();
+        for quality in Quality::ALL {
+            assert!(
+                !seen.contains(&quality.name()),
+                "{} listed twice",
+                quality.name()
+            );
+            seen.push(quality.name());
         }
     }
 }

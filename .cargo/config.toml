@@ -1,0 +1,12 @@
+# Cross-compiling to Windows from macOS or Linux.
+#
+#   rustup target add x86_64-pc-windows-gnu
+#   brew install mingw-w64          # or your distribution's mingw-w64 package
+#   cargo build --release --target x86_64-pc-windows-gnu --example showcase
+#
+# The GNU target rather than MSVC, because the MSVC linker and Windows SDK are
+# not available off Windows. The resulting executable is self-contained: every
+# shader is embedded in the binary and the examples load nothing from disk.
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"
+ar = "x86_64-w64-mingw32-ar"

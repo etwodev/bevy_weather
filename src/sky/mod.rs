@@ -68,6 +68,7 @@ const FLAG_STARS: u32 = 1;
 const FLAG_GALAXY: u32 = 2;
 const FLAG_MOON: u32 = 4;
 const FLAG_CLOUDS: u32 = 8;
+const FLAG_ADAPTIVE_MARCH: u32 = 16;
 
 /// Procedural star field settings.
 #[derive(Resource, Debug, Clone, Reflect)]
@@ -280,6 +281,8 @@ pub struct SkyUniform {
     pub cloud_params2: Vec4,
     /// `x`: exposure. `y`: horizon fade. `z`: steps. `w`: light steps.
     pub cloud_params3: Vec4,
+    /// `x`: distance where erosion starts fading. `y`: where it is gone.
+    pub cloud_params4: Vec4,
     /// Linear cloud albedo.
     pub cloud_albedo: Vec4,
     /// `xyz`: wind displacement in metres. `w`: shape evolution.
@@ -317,6 +320,7 @@ impl Default for SkyUniform {
             cloud_params1: Vec4::new(14_000.0, 1_400.0, 0.35, 0.045),
             cloud_params2: Vec4::new(0.8, -0.25, 0.6, 0.35),
             cloud_params3: Vec4::new(1.0, 0.06, 48.0, 4.0),
+            cloud_params4: Vec4::new(10_000.0, 30_000.0, 0.0, 0.0),
             cloud_albedo: Vec4::ONE,
             cloud_offset: Vec4::ZERO,
             lightning: Vec4::ZERO,
@@ -696,13 +700,15 @@ pub fn build_uniform(
         }
         if clouds_enabled(config, &conditions) {
             flags |= FLAG_CLOUDS;
+            if clouds.adaptive_marching {
+                flags |= FLAG_ADAPTIVE_MARCH;
+            }
         }
     }
 
-    let steps = clouds.steps.unwrap_or_else(|| config.quality.cloud_steps());
-    let light_steps = clouds
-        .light_steps
-        .unwrap_or_else(|| config.quality.cloud_light_steps());
+    let steps = clouds.resolved_steps(config.quality);
+    let light_steps = clouds.resolved_light_steps(config.quality);
+    let detail_strength = clouds.resolved_detail_strength(config.quality);
 
     // Clouds ride higher and faster than surface wind.
     let cloud_offset = wind.offset3() * clouds.wind_multiplier;
@@ -763,7 +769,7 @@ pub fn build_uniform(
         cloud_params1: Vec4::new(
             clouds.shape_scale.max(1.0),
             clouds.detail_scale.max(1.0),
-            clouds.detail_strength.clamp(0.0, 1.0),
+            detail_strength,
             clouds.extinction.max(1e-6),
         ),
         cloud_params2: Vec4::new(
@@ -777,6 +783,12 @@ pub fn build_uniform(
             clouds.horizon_fade.max(1e-4),
             steps as f32,
             light_steps as f32,
+        ),
+        cloud_params4: Vec4::new(
+            clouds.detail_distance.max(0.0),
+            clouds.detail_distance.max(0.0) * 3.0 + 1.0,
+            0.0,
+            0.0,
         ),
         cloud_albedo: clouds.albedo_linear().to_vec3().extend(1.0),
         cloud_offset: cloud_offset.extend(elapsed * clouds.evolution_rate),
@@ -1133,6 +1145,19 @@ mod tests {
         assert!((uniform.moon_direction.truncate().length() - 1.0).abs() < 1e-4);
         assert!((uniform.galaxy_axis.truncate().length() - 1.0).abs() < 1e-4);
         assert!((uniform.galaxy_center.truncate().length() - 1.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn erosion_fades_out_rather_than_stopping() {
+        // A hard cutoff would draw a ring in the sky at a fixed distance, and
+        // it would slide around as the camera moved. The far edge has to sit
+        // well beyond the near one.
+        let cloudy = Weather::new(crate::presets::WeatherPreset::Overcast.conditions());
+        let uniform = uniform_for(cloudy, WeatherConfig::default());
+        let near = uniform.cloud_params4.x;
+        let far = uniform.cloud_params4.y;
+        assert!(near > 0.0, "erosion should survive nearby");
+        assert!(far > near * 2.0, "the fade is too abrupt: {near} to {far}");
     }
 
     #[test]
