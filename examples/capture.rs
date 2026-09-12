@@ -122,6 +122,62 @@ fn shots() -> Vec<Shot> {
             .collect();
     }
 
+    if std::env::var("LENS").is_ok() {
+        // The lens effect, at a few rain intensities and times of day. Bright
+        // scenes behind the glass are the interesting case, since that is where
+        // the refraction has something to show.
+        return vec![
+            shot("lens-rain-day", 11.0, WeatherPreset::Rain, fixed(0.35, 4.0)),
+            shot(
+                "lens-storm-day",
+                11.0,
+                WeatherPreset::Storm,
+                fixed(0.35, 4.0),
+            ),
+            shot(
+                "lens-thunderstorm",
+                15.0,
+                WeatherPreset::Thunderstorm,
+                fixed(0.35, 2.0),
+            ),
+            shot(
+                "lens-drizzle",
+                11.0,
+                WeatherPreset::Drizzle,
+                fixed(0.35, 4.0),
+            ),
+            shot("lens-clear", 11.0, WeatherPreset::Clear, fixed(0.35, 4.0)),
+        ];
+    }
+
+    if let Ok(which) = std::env::var("DUSK") {
+        // Fine steps across twilight, looking well up and away from the sun --
+        // the part of the sky where the stars have to arrive smoothly as the
+        // glow drains out of it.
+        let hours: Vec<f32> = if which == "dawn" {
+            (0..17).map(|i| 2.0 + i as f32 * 0.25).collect()
+        } else {
+            (0..17).map(|i| 18.5 + i as f32 * 0.25).collect()
+        };
+        return hours
+            .into_iter()
+            .map(|hour| Shot {
+                name: Box::leak(
+                    format!("dusk-{hour:05.2}")
+                        .replace('.', "h")
+                        .into_boxed_str(),
+                ),
+                hour,
+                preset: WeatherPreset::Clear,
+                aim: Aim::Fixed {
+                    yaw: 3.4,
+                    pitch: 45.0,
+                },
+                phase: None,
+            })
+            .collect();
+    }
+
     if std::env::var("GODRAYS").is_ok() {
         // Low sun through fog, at eye level, looking almost into it: the one
         // framing where a shadow-cascade boundary shows up as a line ruled
@@ -327,6 +383,21 @@ fn shots() -> Vec<Shot> {
             WeatherPreset::Clear,
             fixed(2.6, 40.0),
         ),
+        // Ground level at night, to see whether the moon throws a shadow.
+        at_phase(
+            Shot {
+                name: "22-moonlit-ground",
+                hour: 0.5,
+                preset: WeatherPreset::Clear,
+                aim: Aim::Aerial {
+                    yaw: 0.35,
+                    pitch: -22.0,
+                    height: 30.0,
+                },
+                phase: None,
+            },
+            0.5,
+        ),
     ]
 }
 
@@ -426,6 +497,8 @@ fn setup(
     mut stars: ResMut<StarConfig>,
     mut meteors: ResMut<MeteorConfig>,
     mut cloud_shadows: ResMut<CloudShadowConfig>,
+    mut moon_light: ResMut<MoonLightConfig>,
+    mut rain_lens: ResMut<RainLensConfig>,
     mut galaxy: ResMut<GalaxyConfig>,
     mut clouds: ResMut<bevy_weather::clouds::CloudConfig>,
     mut config: ResMut<WeatherConfig>,
@@ -446,6 +519,18 @@ fn setup(
     }
     if let Ok(v) = std::env::var("SHADOWTILE") {
         cloud_shadows.tile_size = v.parse().unwrap_or(4_000.0);
+    }
+    if std::env::var("LENS").is_ok() {
+        // The capture only runs half a second of simulated time per shot, so
+        // the lens has to wet much faster than it would in play.
+        rain_lens.wet_seconds = 0.05;
+        rain_lens.dry_seconds = 0.05;
+    }
+    if std::env::var("NO_LENS").is_ok() {
+        rain_lens.enabled = false;
+    }
+    if std::env::var("NO_MOON_SHADOWS").is_ok() {
+        moon_light.shadows = false;
     }
     if std::env::var("NO_CLOUD_SHADOWS").is_ok() {
         cloud_shadows.enabled = false;

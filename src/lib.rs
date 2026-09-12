@@ -11,6 +11,7 @@ pub mod math;
 pub mod precipitation;
 pub mod presets;
 pub mod procedural;
+pub mod rain_lens;
 pub mod sky;
 pub mod state;
 pub mod thunder;
@@ -24,7 +25,7 @@ use bevy::prelude::Update;
 /// Everything you normally need, in one `use`.
 pub mod prelude {
     pub use crate::atmosphere::AtmosphereConfig;
-    pub use crate::celestial::{CelestialBodies, MoonLight, SunConfig, SunLight};
+    pub use crate::celestial::{CelestialBodies, MoonLight, MoonLightConfig, SunConfig, SunLight};
     pub use crate::cloud_shadows::CloudShadowConfig;
     pub use crate::clouds::CloudConfig;
     pub use crate::config::{Quality, WeatherCamera, WeatherConfig};
@@ -32,6 +33,7 @@ pub mod prelude {
     pub use crate::precipitation::PrecipitationConfig;
     pub use crate::presets::WeatherPreset;
     pub use crate::procedural::{Climate, ProceduralWeather};
+    pub use crate::rain_lens::{LensWetness, RainLens, RainLensConfig};
     pub use crate::sky::{GalaxyConfig, MeteorConfig, MoonConfig, StarConfig};
     pub use crate::state::{Weather, WeatherConditions};
     pub use crate::thunder::{LightningStrike, ThunderConfig};
@@ -105,6 +107,7 @@ impl Plugin for WeatherPlugin {
             cloud_shadows::CloudShadowPlugin,
             fog::WeatherFogPlugin,
             precipitation::PrecipitationPlugin,
+            rain_lens::RainLensPlugin,
             thunder::ThunderPlugin,
         ));
     }
@@ -138,6 +141,7 @@ impl PluginGroup for WeatherPlugins {
             .add(cloud_shadows::CloudShadowPlugin)
             .add(fog::WeatherFogPlugin)
             .add(precipitation::PrecipitationPlugin)
+            .add(rain_lens::RainLensPlugin)
             .add(thunder::ThunderPlugin)
     }
 }
@@ -149,6 +153,11 @@ pub struct CorePlugin;
 impl Plugin for CorePlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<config::WeatherConfig>()
+            // Plain configuration, even though the sky is what draws from it.
+            // The celestial and cloud-shadow plugins both read it too, and a
+            // resource owned by the rendering plugin would make either of them
+            // panic in a build that had disabled the sky.
+            .init_resource::<clouds::CloudConfig>()
             .init_resource::<time::WeatherTime>()
             .init_resource::<procedural::ProceduralWeather>()
             .init_resource::<state::Weather>()

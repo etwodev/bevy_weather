@@ -316,6 +316,7 @@ fn weather_controls(
     mut atmosphere: ResMut<AtmosphereConfig>,
     mut cloud_shadows: ResMut<CloudShadowConfig>,
     mut meteors: ResMut<MeteorConfig>,
+    mut rain_lens: ResMut<RainLensConfig>,
     time: Res<Time>,
 ) {
     // ---- Clock -------------------------------------------------------------
@@ -408,6 +409,9 @@ fn weather_controls(
     if keys.just_pressed(KeyCode::Digit7) {
         cloud_shadows.enabled = !cloud_shadows.enabled;
     }
+    if keys.just_pressed(KeyCode::Digit9) {
+        rain_lens.enabled = !rain_lens.enabled;
+    }
     if keys.just_pressed(KeyCode::Digit8) {
         // Meteors are rare on purpose -- a couple a minute at the default rate,
         // spread over the whole sky, which means you will probably never see
@@ -441,6 +445,8 @@ fn update_ui(
     wind: Res<Wind>,
     cloud_shadows: Res<CloudShadowConfig>,
     meteors: Res<MeteorConfig>,
+    rain_lens: Res<RainLensConfig>,
+    wetness: Res<LensWetness>,
 ) {
     let Ok(mut text) = text.single_mut() else {
         return;
@@ -490,6 +496,7 @@ bevy_weather showcase   {frame:5.2} ms  ({fps:3.0} fps, {p95:5.2} ms p95)
   Toggles     [1] clouds {clouds}  [2] fog {vfog}  [3] precip {precip}
               [4] sky {sky}  [5] thunder {thunder_on}  [6] raymarched sky
               [7] cloud shadows {cloud_shadows}  [8] meteor shower {shower}
+              [9] rain on lens {lens} (wetness {wetness:.2})
 
   Move        WASD / Q E   (Shift to sprint)   Esc grabs the mouse
   Time        Space pause   [ ] slower/faster   <- -> scrub   Up/Down +/- a day
@@ -505,6 +512,8 @@ bevy_weather showcase   {frame:5.2} ms  ({fps:3.0} fps, {p95:5.2} ms p95)
         p95 = stats.p95(),
         cloud_shadows = on_off(cloud_shadows.enabled),
         shower = on_off(meteors.rate > 10.0),
+        lens = on_off(rain_lens.enabled),
+        wetness = wetness.0,
         day = weather_time.day,
         h = hour as u32,
         m = ((hour - hour.floor()) * 60.0) as u32,
@@ -621,6 +630,7 @@ struct Knobs<'a> {
     precipitation: &'a mut PrecipitationConfig,
     clouds: &'a mut CloudConfig,
     cloud_shadows: &'a mut CloudShadowConfig,
+    rain_lens: &'a mut RainLensConfig,
     conditions: &'a mut Weather,
 }
 
@@ -670,6 +680,13 @@ const SCENARIOS: &[Scenario] = &[
     Scenario {
         name: "+ rain and snow",
         apply: |k| set(k, true, true, true, true, true, true, false),
+    },
+    Scenario {
+        name: "+ rain on lens",
+        apply: |k| {
+            set(k, true, true, true, true, true, true, false);
+            k.rain_lens.enabled = true;
+        },
     },
     // Cloud cost is not one number. A clear sky skips the raymarch outright and
     // a solid deck extinguishes each ray almost immediately; the expensive case
@@ -732,6 +749,12 @@ fn set(
     k.weather.volumetric_fog = fog;
     k.precipitation.particle_count = None;
     k.clouds.adaptive_marching = true;
+    k.rain_lens.enabled = false;
+    // The lens normally takes seconds to wet and much longer to dry, which is
+    // right in play and useless here: a scenario is forty frames long, so the
+    // effect would still be fading in when its measurement ended.
+    k.rain_lens.wet_seconds = 0.0;
+    k.rain_lens.dry_seconds = 0.0;
 }
 
 /// What the benchmark borrowed and has to give back.
@@ -741,6 +764,7 @@ struct SavedState {
     precipitation: PrecipitationConfig,
     clouds: CloudConfig,
     cloud_shadows: CloudShadowConfig,
+    rain_lens: RainLensConfig,
     conditions: WeatherConditions,
     procedural: bool,
     paused: bool,
@@ -838,6 +862,7 @@ fn run_benchmark(
     mut precipitation: ResMut<PrecipitationConfig>,
     mut cloud_config: ResMut<CloudConfig>,
     mut cloud_shadows: ResMut<CloudShadowConfig>,
+    mut bench_lens: ResMut<RainLensConfig>,
     mut weather: ResMut<Weather>,
     mut procedural: ResMut<ProceduralWeather>,
     mut weather_time: ResMut<WeatherTime>,
@@ -854,6 +879,7 @@ fn run_benchmark(
             precipitation: precipitation.clone(),
             clouds: cloud_config.clone(),
             cloud_shadows: cloud_shadows.clone(),
+            rain_lens: bench_lens.clone(),
             conditions: weather.target,
             procedural: procedural.enabled,
             paused: weather_time.paused,
@@ -892,6 +918,7 @@ fn run_benchmark(
             *precipitation = saved.precipitation;
             *cloud_config = saved.clouds;
             *cloud_shadows = saved.cloud_shadows;
+            *bench_lens = saved.rain_lens;
             weather.set_immediate(saved.conditions);
             procedural.enabled = saved.procedural;
             weather_time.paused = saved.paused;
@@ -912,6 +939,7 @@ fn run_benchmark(
             precipitation: &mut precipitation,
             clouds: &mut cloud_config,
             cloud_shadows: &mut cloud_shadows,
+            rain_lens: &mut bench_lens,
             conditions: &mut weather,
         });
     }

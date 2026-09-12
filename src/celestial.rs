@@ -17,6 +17,7 @@ use bevy::prelude::Entity;
 use bevy::reflect::Reflect;
 use bevy::transform::components::Transform;
 
+use crate::cloud_field::CloudField;
 use crate::config::{WeatherCamera, WeatherConfig};
 use crate::state::Weather;
 use crate::time::WeatherTime;
@@ -139,6 +140,48 @@ impl Default for SunConfig {
             shadow_near_distance: 40.0,
             shadow_cascades: 4,
             shadow_cascade_overlap: 0.3,
+        }
+    }
+}
+
+/// The moonlight: how much of it there is, and whether it casts shadows.
+///
+/// Separate from [`MoonConfig`](crate::sky::MoonConfig), which is about how the
+/// moon *looks*. This is about what it does to the scene below.
+#[derive(Resource, Debug, Clone, Reflect)]
+#[reflect(Resource, Default)]
+pub struct MoonLightConfig {
+    /// Illuminance of a full moon at the zenith, in lux.
+    ///
+    /// The true figure is about a quarter of a lux, which at the daylight
+    /// exposure this plugin targets is indistinguishable from black. This is
+    /// the conventional "day for night" lift, and it is the same exaggeration
+    /// the moon's own disc and the star field already carry.
+    pub illuminance: f32,
+
+    /// Colour of moonlight.
+    ///
+    /// Moonlight is very slightly *warmer* than sunlight in reality -- it is
+    /// sunlight off a grey rock. It looks blue because the eye's colour vision
+    /// gives out at those levels and the rods take over, and every film ever
+    /// shot day-for-night has taught everyone to expect it, so blue it is.
+    pub color: Color,
+
+    /// Cast shadows from the moon.
+    ///
+    /// A full moon really does throw a shadow you can see, and it is one of the
+    /// things that makes a night scene read as lit rather than as merely dark.
+    /// It costs a second set of cascaded shadow maps, so it is switched off
+    /// automatically whenever the moon is down, new, or washed out by daylight.
+    pub shadows: bool,
+}
+
+impl Default for MoonLightConfig {
+    fn default() -> Self {
+        Self {
+            illuminance: MOONLIGHT_ILLUMINANCE,
+            color: Color::srgb(0.72, 0.80, 1.0),
+            shadows: true,
         }
     }
 }
@@ -295,8 +338,10 @@ impl Plugin for CelestialPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<CelestialBodies>()
             .init_resource::<SunConfig>()
+            .init_resource::<MoonLightConfig>()
             .register_type::<CelestialBodies>()
             .register_type::<SunConfig>()
+            .register_type::<MoonLightConfig>()
             .register_type::<SunLight>()
             .register_type::<MoonLight>()
             .add_systems(
@@ -316,6 +361,7 @@ fn spawn_lights(
     mut commands: Commands,
     config: Res<WeatherConfig>,
     sun_config: Res<SunConfig>,
+    moon_config: Res<MoonLightConfig>,
     suns: Query<(), With<SunLight>>,
     moons: Query<(), With<MoonLight>>,
 ) {
@@ -333,7 +379,7 @@ fn spawn_lights(
                 ..Default::default()
             },
             VolumetricLight,
-            sun_disk(&sun_config),
+            sun_disk(&sun_config, 1.0),
             sun_config.cascades(),
             Transform::default(),
         ));
@@ -344,10 +390,13 @@ fn spawn_lights(
             DirectionalLight {
                 illuminance: 0.0,
                 shadow_maps_enabled: false,
-                color: Color::srgb(0.72, 0.80, 1.0),
+                color: moon_config.color,
                 ..Default::default()
             },
             VolumetricLight,
+            // The moon shares the sun's cascade layout: how far shadows reach
+            // is a property of the scene, not of which body is casting them.
+            sun_config.cascades(),
             // Not optional. Bevy's atmosphere draws a sun disc for every
             // directional light, and a light with no `SunDisk` component falls
             // back to `SunDisk::EARTH` -- so the moon light gets a second,
@@ -379,21 +428,70 @@ impl SunConfig {
     }
 }
 
-/// The [`SunDisk`] a [`SunConfig`] asks for.
-fn sun_disk(config: &SunConfig) -> SunDisk {
-    if !config.disk || config.disk_intensity <= 0.0 {
+/// The [`SunDisk`] a [`SunConfig`] asks for, dimmed by `transmittance`.
+fn sun_disk(config: &SunConfig, transmittance: f32) -> SunDisk {
+    let intensity = config.disk_intensity * transmittance.clamp(0.0, 1.0);
+    if !config.disk || intensity <= 1e-4 {
         return SunDisk::OFF;
     }
     SunDisk {
         // Bevy measures the disc as a diameter.
         angular_size: config.angular_radius.max(0.0) * 2.0,
-        intensity: config.disk_intensity,
+        intensity,
     }
+}
+
+/// How much of the sun's disc survives the cloud directly up-sun of the camera.
+///
+/// The disc is drawn by the atmosphere pass, which runs *before* the cloud
+/// layer and knows nothing about it, so the clouds have to hide it by drawing
+/// over it -- and they cannot. The disc's radiance is four orders of magnitude
+/// past anything else in the frame, so even a deck the raymarch has taken to
+/// 99% opacity leaves a residual a hundred times brighter than the cloud it is
+/// shining through. Chasing the last percent of opacity does not help; the
+/// disc has to be put out at the source.
+///
+/// So it is, by asking the cloud field itself. One sample of the column the
+/// sunlight actually came down, at the point where the ray from the camera
+/// crosses the middle of the deck, and Beer-Lambert on the result. The sun goes
+/// out behind a cumulus and comes back in the gap behind it, at the moment the
+/// cloud overhead says it should, rather than being dimmed by an average of a
+/// sky that is half clear.
+fn sun_disk_transmittance(field: &CloudField, eye_metres: Vec3, sun: Vec3, extinction: f32) -> f32 {
+    if field.coverage <= 0.001 {
+        return 1.0;
+    }
+    let deck = field.base_altitude + field.thickness * 0.5;
+    if eye_metres.y >= deck {
+        // Above the deck, looking up at clear sky.
+        return 1.0;
+    }
+    // A sun this low is being extinguished by the air rather than by cloud, and
+    // the crossing point runs away to the horizon.
+    let elevation = sun.y;
+    if elevation <= 0.02 {
+        return 1.0;
+    }
+    let travel = (deck - eye_metres.y) / elevation;
+    let hit = eye_metres + sun * travel;
+    (-field.column_density(hit.x, hit.z) * extinction.max(1e-6)).exp()
 }
 
 /// Illuminance of a full moon, exaggerated well past the true ~0.3 lux so that
 /// nights are legible at a daylight exposure.
-const MOONLIGHT_ILLUMINANCE: f32 = 2_000.0;
+///
+/// Balanced against [`NIGHT_AMBIENT_LUX`] rather than chosen on its own. What
+/// makes a moonlit night read as *lit* is the ratio between the two: moonlight
+/// is one small, hard source and the skyglow around it is faint, which is why a
+/// full moon throws a shadow you can read by. Set the two close together and
+/// the night is uniformly grey with no shadows in it at all.
+const MOONLIGHT_ILLUMINANCE: f32 = 4_000.0;
+
+/// Solar altitude, as a sine, below which the sun stops rendering shadows.
+///
+/// The atmosphere has already extinguished it completely by this point, so the
+/// shadow maps would be drawn for a light that reaches nothing.
+const SHADOW_CUTOFF_ALTITUDE: f32 = -0.02;
 
 /// Diffuse illuminance, in lux, added by a fully overcast sky in daylight.
 ///
@@ -403,12 +501,14 @@ const MOONLIGHT_ILLUMINANCE: f32 = 2_000.0;
 /// collapses to black once the direct sun is attenuated.
 const OVERCAST_AMBIENT_LUX: f32 = 13_000.0;
 
-/// Diffuse illuminance, in lux, on a clear moonlit night.
+/// Diffuse illuminance, in lux, on a clear night.
 ///
 /// Far above the real value. A true moonlit night is a fraction of a lux, which
 /// at the daylight exposure this plugin targets is indistinguishable from
 /// black; this is the conventional "day for night" lift.
-const NIGHT_AMBIENT_LUX: f32 = 1_800.0;
+///
+/// Deliberately well below [`MOONLIGHT_ILLUMINANCE`]; see the note there.
+const NIGHT_AMBIENT_LUX: f32 = 1_100.0;
 
 /// The sun light, excluding the moon so the two can be queried together.
 type SunQuery<'w, 's> = Query<
@@ -427,7 +527,11 @@ type SunQuery<'w, 's> = Query<
 type MoonQuery<'w, 's> = Query<
     'w,
     's,
-    (&'static mut Transform, &'static mut DirectionalLight),
+    (
+        Entity,
+        &'static mut Transform,
+        &'static mut DirectionalLight,
+    ),
     (With<MoonLight>, Without<SunLight>),
 >;
 
@@ -440,8 +544,12 @@ fn drive_lights(
     bodies: Res<CelestialBodies>,
     config: Res<WeatherConfig>,
     sun_config: Res<SunConfig>,
+    moon_config: Res<MoonLightConfig>,
     weather: Res<Weather>,
-    cameras: Query<Entity, With<WeatherCamera>>,
+    clouds: Res<crate::clouds::CloudConfig>,
+    wind: Res<crate::wind::Wind>,
+    time: Res<bevy::time::Time>,
+    cameras: Query<(Entity, &bevy::transform::components::GlobalTransform), With<WeatherCamera>>,
     mut sun: SunQuery,
     mut moon: MoonQuery,
 ) {
@@ -463,7 +571,27 @@ fn drive_lights(
     let overcast = 1.0 - 0.95 * opacity;
     let scale = config.light_intensity_scale.max(0.0);
 
-    let disk = sun_disk(&sun_config);
+    // One sample of the cloud column the sun is shining down, so the disc can
+    // be put out by the cloud that is actually in front of it.
+    let field = CloudField::new(
+        &weather.current,
+        &clouds,
+        wind.offset,
+        time.elapsed_secs_wrapped(),
+    );
+    let metres_to_world = config.units_per_meter.max(1e-6);
+    let eye = cameras
+        .iter()
+        .next()
+        .map(|(_, transform)| transform.translation() / metres_to_world)
+        .unwrap_or(Vec3::ZERO);
+    let disk_transmittance = if config.clouds {
+        sun_disk_transmittance(&field, eye, bodies.sun_direction, clouds.extinction)
+    } else {
+        1.0
+    };
+
+    let disk = sun_disk(&sun_config, disk_transmittance);
     for (entity, mut transform, mut light, existing_disk) in &mut sun {
         // A directional light shines along its local `-Z`, so it must look
         // *away* from the body it represents.
@@ -478,9 +606,40 @@ fn drive_lights(
                 .looking_to(-bodies.sun_direction, Vec3::Y)
                 .rotation;
         }
-        // Fade out below the horizon rather than snapping, so shadows don't pop.
-        let visibility = remap01(bodies.sun_altitude, -0.02, 0.06);
+        // How much of the sun to hand the renderer.
+        //
+        // The obvious thing is to cut this to zero the moment the sun sets, and
+        // it is wrong, because the same number drives the *sky*. Bevy's
+        // atmosphere computes its inscattering as the light's colour times a
+        // scattering factor, so zeroing the light at the horizon does not end
+        // the day -- it switches twilight off. The sky went from a sunset to
+        // black in about fifteen minutes, with nothing in between.
+        //
+        // Nor is the cut needed to stop the sun lighting the scene from
+        // underneath the world. Bevy already multiplies every directional
+        // light's contribution to a surface by the atmospheric transmittance
+        // toward it and by how much of its disc clears the horizon, so a sun
+        // below the horizon reaches no geometry on its own account.
+        //
+        // What the ramp is really for is everything that does *not* go through
+        // that path: `DistanceFog`'s directional scattering and the volumetric
+        // fog both read the light's colour raw, and would happily light the air
+        // from a sun that set an hour ago. So it stays -- but stretched across
+        // real twilight instead of a degree, and squared, so the glow persists
+        // through the part of dusk that has one and is gone by the part that
+        // does not.
+        let visibility = if config.atmosphere {
+            let ramp = remap01(bodies.sun_altitude, -0.22, 0.02);
+            ramp * ramp
+        } else {
+            // With no atmosphere pass there is nothing to extinguish the light,
+            // so the hard cut is all there is.
+            remap01(bodies.sun_altitude, -0.02, 0.06)
+        };
         light.illuminance = lux::RAW_SUNLIGHT * visibility * overcast * scale;
+        // Shadow maps for a light the atmosphere has already put out are pure
+        // cost, so they stop at the horizon even though the light does not.
+        light.shadow_maps_enabled = bodies.sun_altitude > SHADOW_CUTOFF_ALTITUDE;
         // Deliberately *not* `bodies.sun_color`. That is the colour sunlight
         // has by the time it reaches the ground, which is what this plugin's
         // own shaders want -- they composite outside the atmosphere pass and
@@ -488,17 +647,21 @@ fn drive_lights(
         // extinction and wants the raw spectrum; see `SunConfig::light_tint`.
         light.color = Color::LinearRgba(sun_tint(bodies.sun_altitude, sun_config.light_tint));
 
-        // Only rewrite when something actually changed, so a user adjusting
-        // `SunDisk` by hand on their own light is not fought every frame.
+        // The disc now tracks the cloud overhead, so it is rewritten whenever
+        // that has moved rather than only when the config changes.
+        let moved = existing_disk.is_none_or(|existing| {
+            (existing.intensity - disk.intensity).abs() > 1e-4
+                || (existing.angular_size - disk.angular_size).abs() > 1e-6
+        });
+        if moved {
+            commands.entity(entity).insert(disk.clone());
+        }
         if existing_disk.is_none() || sun_config.is_changed() {
-            commands
-                .entity(entity)
-                .insert(disk.clone())
-                .insert(sun_config.cascades());
+            commands.entity(entity).insert(sun_config.cascades());
         }
     }
 
-    for (mut transform, mut light) in &mut moon {
+    for (entity, mut transform, mut light) in &mut moon {
         if bodies.moon_direction.y > -0.999 {
             transform.rotation = Transform::default()
                 .looking_to(-bodies.moon_direction, Vec3::Y)
@@ -507,12 +670,20 @@ fn drive_lights(
         let visibility = remap01(bodies.moon_altitude, -0.02, 0.06);
         // Moonlight only reads once the sun is out of the way.
         let night = 1.0 - bodies.daylight;
-        light.illuminance = MOONLIGHT_ILLUMINANCE
+        light.color = moon_config.color;
+        light.illuminance = moon_config.illuminance.max(0.0)
             * bodies.moon_illumination
             * visibility
             * night
             * overcast
             * scale;
+        // A second set of cascades is not worth rendering for a light that is
+        // contributing nothing, which is most of the time: the moon is down, or
+        // new, or the sun is up.
+        light.shadow_maps_enabled = moon_config.shadows && light.illuminance > 1.0;
+        if moon_config.is_changed() || sun_config.is_changed() {
+            commands.entity(entity).insert(sun_config.cascades());
+        }
     }
 
     // The diffuse term the atmosphere's environment map cannot know about:
@@ -522,7 +693,10 @@ fn drive_lights(
     // cloud arrives diffuse *and* greatly reduced.
     let overcast_ambient =
         OVERCAST_AMBIENT_LUX * cloudiness * bodies.daylight * (1.0 - 0.6 * depth);
-    let night_ambient = NIGHT_AMBIENT_LUX * night * (0.25 + 0.75 * bodies.moon_illumination);
+    // Most of what little light a moonless night has is airglow and starlight,
+    // so the floor does not scale all the way down with the moon -- but a full
+    // moon does brighten the whole sky, so some of it does.
+    let night_ambient = NIGHT_AMBIENT_LUX * night * (0.35 + 0.65 * bodies.moon_illumination);
     let brightness = (overcast_ambient + night_ambient) * scale;
     // Overcast light is grey; night is blue, because what little there is has
     // been scattered by the atmosphere.
@@ -530,7 +704,7 @@ fn drive_lights(
         LinearRgba::rgb(0.85, 0.90, 1.0).mix(&LinearRgba::WHITE, bodies.daylight),
     );
 
-    for entity in &cameras {
+    for (entity, _) in &cameras {
         commands.entity(entity).insert(AmbientLight {
             color,
             brightness,

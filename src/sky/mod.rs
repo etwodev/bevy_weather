@@ -64,6 +64,23 @@ pub const EARTH_RADIUS_M: f32 = 6_371_000.0;
 /// is unavoidable no matter how the rest is authored.
 const NIGHT_SCALE: f32 = 3_000.0;
 
+/// The night-sky scale, corrected for a camera exposure that is not the one it
+/// was authored against.
+///
+/// The night sky is the one part of the frame whose radiance is invented rather
+/// than measured, so it is the one part that should not move when the exposure
+/// does. Leave it alone and
+/// [`twilight_exposure_lift`](crate::atmosphere::AtmosphereConfig::twilight_exposure_lift)
+/// makes the stars brightest in late twilight and then dims them as the night
+/// deepens -- precisely backwards, and very obvious, because the sky behind
+/// them is getting darker at the same time.
+///
+/// Cancelling the lift holds the stars still while the sky drains away
+/// underneath them, which is what actually happens outdoors.
+fn night_scale(exposure_lift_stops: f32) -> f32 {
+    NIGHT_SCALE * (-exposure_lift_stops).exp2()
+}
+
 const FLAG_STARS: u32 = 1;
 const FLAG_GALAXY: u32 = 2;
 const FLAG_MOON: u32 = 4;
@@ -684,6 +701,7 @@ pub struct SkyInputs<'w> {
     weather_time: Res<'w, WeatherTime>,
     wind: Res<'w, Wind>,
     lightning: Res<'w, LightningState>,
+    atmosphere: Res<'w, crate::atmosphere::AtmosphereConfig>,
 }
 
 /// How often the sky material's uniform is rebuilt: every frame.
@@ -708,6 +726,13 @@ fn update_sky(
         &sky.weather_time,
         &sky.wind,
         &sky.lightning,
+        // Only when the plugin is actually driving exposure; a game managing
+        // its own is not having anything cancelled behind its back.
+        if sky.atmosphere.exposure_ev100.is_some() && sky.config.atmosphere {
+            sky.atmosphere.exposure_lift(sky.bodies.sun_altitude)
+        } else {
+            0.0
+        },
         time.elapsed_secs_wrapped(),
     );
 
@@ -743,9 +768,11 @@ pub fn build_uniform(
     weather_time: &WeatherTime,
     wind: &Wind,
     lightning: &LightningState,
+    exposure_lift_stops: f32,
     elapsed: f32,
 ) -> SkyUniform {
     let conditions = weather.current;
+    let night_scale = night_scale(exposure_lift_stops);
 
     let mut flags = 0u32;
     if config.sky {
@@ -786,11 +813,11 @@ pub fn build_uniform(
         sun_direction: sun.extend(bodies.sun_angular_radius),
         moon_direction: moon_dir.extend(moon.angular_radius.max(1e-5)),
         sun_color: sun_color.extend(bodies.daylight),
-        moon_color: (moon_tint * NIGHT_SCALE).extend(bodies.moon_illumination),
+        moon_color: (moon_tint * night_scale).extend(bodies.moon_illumination),
 
         star_params: Vec4::new(
             stars.density.max(1.0),
-            stars.brightness * NIGHT_SCALE,
+            stars.brightness * night_scale,
             stars.twinkle_speed,
             stars.size.max(1e-4),
         ),
@@ -802,7 +829,7 @@ pub fn build_uniform(
         ),
 
         galaxy_params: Vec4::new(
-            galaxy.brightness * NIGHT_SCALE,
+            galaxy.brightness * night_scale,
             galaxy.noise_scale,
             galaxy.dust.clamp(0.0, 1.0),
             galaxy.band_tightness.max(0.1),
@@ -816,7 +843,7 @@ pub fn build_uniform(
         galaxy_center: galaxy.center.normalize_or(Vec3::Z).extend(0.0),
 
         moon_params: Vec4::new(
-            moon.brightness * NIGHT_SCALE,
+            moon.brightness * night_scale,
             moon.earthshine.max(0.0),
             moon.surface_detail.clamp(0.0, 1.0),
             bodies.moon_phase,
@@ -827,7 +854,7 @@ pub fn build_uniform(
             meteors.rate.max(0.0),
             meteors.arc_length.max(1e-3),
             meteors.width.max(1e-4),
-            meteors.brightness.max(0.0) * NIGHT_SCALE,
+            meteors.brightness.max(0.0) * night_scale,
         ),
 
         cloud_params0: Vec4::new(
@@ -1169,6 +1196,7 @@ mod tests {
             &time,
             &Wind::default(),
             &LightningState::default(),
+            0.0,
             0.0,
         )
     }

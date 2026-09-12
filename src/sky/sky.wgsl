@@ -311,7 +311,11 @@ fn cube_face(dir: vec3<f32>) -> vec3<f32> {
     return vec3(dir.x / a.z, dir.y / a.z, face);
 }
 
-fn star_field(star_dir: vec3<f32>, horizon_factor: f32) -> vec3<f32> {
+/// The star field.
+///
+/// `night` is how dark the sky has become, from zero at sunset to one once
+/// twilight is over.
+fn star_field(star_dir: vec3<f32>, horizon_factor: f32, night: f32) -> vec3<f32> {
     let density = max(sky.star_params.x, 1.0);
     let brightness = sky.star_params.y;
     let twinkle_rate = sky.star_params.z;
@@ -353,6 +357,28 @@ fn star_field(star_dir: vec3<f32>, horizon_factor: f32) -> vec3<f32> {
             // speckle -- recognisably noise rather than a sky.
             let magnitude = pow(rnd.y, magnitude_falloff);
 
+            // Stars arrive in order of brightness, the way they do outdoors:
+            // one or two are out before the colour has left the sky, a dozen a
+            // few minutes later, and the faint majority only once it is
+            // properly dark.
+            //
+            // Fading the whole field together instead -- one multiplier for
+            // every star -- leaves a long stretch after sunset with a black sky
+            // and nothing in it, because the multiplier is small and every star
+            // is below the threshold of visibility at once. The gap is the most
+            // noticeable thing about the transition, and it is entirely an
+            // artefact of treating the sky as a single dimmer.
+            //
+            // Squared, so the brightest few break through very early and the
+            // bulk of the field is spread across the rest of twilight rather
+            // than all landing together.
+            let faintness = 1.0 - magnitude;
+            let threshold = faintness * faintness * 0.85;
+            let emerged = saturate((night - threshold) / 0.18);
+            if emerged <= 0.0 {
+                continue;
+            }
+
             // Scintillation is an atmospheric effect, so it is strongest near
             // the horizon where you look through the most air.
             let phase = rnd.z * 100.0;
@@ -372,7 +398,7 @@ fn star_field(star_dir: vec3<f32>, horizon_factor: f32) -> vec3<f32> {
             let hot = vec3(0.72, 0.80, 1.0);
             let tint = mix(vec3(1.0), mix(cool, hot, temperature), color_spread);
 
-            accumulated += tint * magnitude * falloff * max(twinkle, 0.0);
+            accumulated += tint * magnitude * falloff * max(twinkle, 0.0) * emerged;
         }
     }
 
@@ -1279,9 +1305,14 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     // night sky here is deliberately exaggerated to stay legible at a fixed
     // daylight exposure, and has to be faded back out explicitly.
     //
-    // The band matches real twilight: first stars at about -6 degrees of sun
-    // altitude, a full sky by about -15.
-    let night = 1.0 - smoothstep(-0.26, -0.05, sky.sun_direction.y);
+    // How dark the sky has got, zero at sunset and one once twilight is over.
+    //
+    // A straight ramp rather than a smoothstep, and across the whole of real
+    // twilight rather than a narrow band. A smoothstep is nearly flat at both
+    // ends, which puts a long stretch just after sunset where the value is
+    // technically rising and visually still zero -- and that stretch is exactly
+    // where the first stars belong.
+    let night = saturate((-0.035 - sky.sun_direction.y) / 0.27);
 
     // The moon occupies a fraction of a degree, so the overwhelming majority of
     // pixels are nowhere near it. One dot product rejects them before any of
@@ -1306,16 +1337,21 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         // of thing the eye picks up immediately even at twenty pixels across.
         let behind_moon = 1.0 - moon_cover;
         if (flags & FLAG_GALAXY) != 0u {
-            color += galaxy(star_dir) * night * behind_moon;
+            // The Milky Way is a diffuse glow rather than a set of points, so
+            // it needs a genuinely dark sky and is the last thing to appear.
+            let emerged = smoothstep(0.25, 0.9, night);
+            color += galaxy(star_dir) * emerged * behind_moon;
         }
         if (flags & FLAG_STARS) != 0u {
-            color += star_field(star_dir, horizon_factor) * night * behind_moon;
+            // Faded per star rather than as a whole; see `star_field`.
+            color += star_field(star_dir, horizon_factor, night) * behind_moon;
         }
         if (flags & FLAG_METEORS) != 0u {
             // Meteors burn up sixty miles up, well inside the moon's orbit, so
             // unlike the stars they are not occluded by it -- but they are so
             // brief that it never comes up.
-            color += meteors(ray, sky.misc.x) * night;
+            // A meteor is bright enough to show against a twilight sky.
+            color += meteors(ray, sky.misc.x) * smoothstep(0.02, 0.35, night);
         }
     }
 

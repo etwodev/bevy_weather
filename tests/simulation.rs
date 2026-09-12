@@ -427,3 +427,165 @@ fn cloud_shadows_follow_the_clouds_rather_than_the_ground() {
         .sum();
     assert!((a - b).abs() < 1e-2, "{a} vs {b}");
 }
+
+#[test]
+fn twilight_is_not_switched_off_at_the_horizon() {
+    // Bevy's atmosphere computes its inscattering as the sun light's colour
+    // times a scattering factor, so cutting the light's illuminance at sunset
+    // does not end the day -- it deletes twilight, and the sky drops from a
+    // sunset to black in a few minutes with nothing in between.
+    let mut app = simulation_app();
+    app.add_plugins(CelestialPlugin);
+
+    let illuminance_at = |app: &mut App, hour: f32| {
+        app.world_mut().resource_mut::<WeatherTime>().set_hour(hour);
+        app.update();
+        app.update();
+        let mut suns = app
+            .world_mut()
+            .query_filtered::<&DirectionalLight, bevy::ecs::query::With<SunLight>>();
+        suns.iter(app.world()).next().unwrap().illuminance
+    };
+
+    // Northern summer at the default latitude: the sun sets a little before
+    // eight, so these bracket it.
+    let daylight = illuminance_at(&mut app, 15.0);
+    let just_after_sunset = illuminance_at(&mut app, 20.0);
+    let deep_twilight = illuminance_at(&mut app, 20.6);
+    let night = illuminance_at(&mut app, 23.0);
+
+    assert!(daylight > 1000.0);
+    assert!(
+        just_after_sunset > daylight * 0.05,
+        "the sky went out at the horizon: {just_after_sunset} against {daylight}"
+    );
+    assert!(
+        deep_twilight < just_after_sunset,
+        "twilight should be draining, not steady"
+    );
+    assert_eq!(night, 0.0, "the sun is still lighting the air at 23:00");
+}
+
+#[test]
+fn the_sun_stops_casting_shadows_once_it_has_set() {
+    // The light stays on through twilight for the sky's sake, but the shadow
+    // maps would be drawn for a light the atmosphere has already extinguished.
+    let mut app = simulation_app();
+    app.add_plugins(CelestialPlugin);
+
+    let shadows_at = |app: &mut App, hour: f32| {
+        app.world_mut().resource_mut::<WeatherTime>().set_hour(hour);
+        app.update();
+        app.update();
+        let mut suns = app
+            .world_mut()
+            .query_filtered::<&DirectionalLight, bevy::ecs::query::With<SunLight>>();
+        suns.iter(app.world()).next().unwrap().shadow_maps_enabled
+    };
+    assert!(shadows_at(&mut app, 13.0));
+    assert!(!shadows_at(&mut app, 22.0));
+}
+
+#[test]
+fn the_moon_casts_shadows_only_when_it_is_contributing() {
+    // A second set of cascades is not worth rendering for a light that reaches
+    // nothing, which is most of the time.
+    let mut app = simulation_app();
+    app.add_plugins(CelestialPlugin);
+    app.world_mut()
+        .resource_mut::<WeatherTime>()
+        .moon_phase_offset = 0.5;
+
+    let moon_shadows_at = |app: &mut App, hour: f32| {
+        app.world_mut().resource_mut::<WeatherTime>().set_hour(hour);
+        app.update();
+        app.update();
+        let mut moons = app
+            .world_mut()
+            .query_filtered::<&DirectionalLight, bevy::ecs::query::With<MoonLight>>();
+        moons.iter(app.world()).next().unwrap().shadow_maps_enabled
+    };
+    // A full moon at midnight is high and the sun is nowhere.
+    assert!(
+        moon_shadows_at(&mut app, 0.5),
+        "a full moon casts no shadow"
+    );
+    // Midday: the moon is down and the sun would drown it anyway.
+    assert!(!moon_shadows_at(&mut app, 12.0));
+}
+
+#[test]
+fn moonlight_is_well_clear_of_the_night_ambient() {
+    // What makes a moonlit night read as *lit* is the ratio between the one
+    // hard source and the skyglow around it. Set them close together and the
+    // night is uniformly grey with no shadows in it, however many shadow maps
+    // are being rendered.
+    let mut app = simulation_app();
+    app.add_plugins(CelestialPlugin);
+    app.world_mut()
+        .resource_mut::<WeatherTime>()
+        .moon_phase_offset = 0.5;
+    app.world_mut().resource_mut::<WeatherTime>().set_hour(0.5);
+    app.update();
+    app.update();
+
+    let mut moons = app
+        .world_mut()
+        .query_filtered::<&DirectionalLight, bevy::ecs::query::With<MoonLight>>();
+    let direct = moons.iter(app.world()).next().unwrap().illuminance;
+
+    let mut ambients = app.world_mut().query::<&bevy::light::AmbientLight>();
+    let ambient = ambients
+        .iter(app.world())
+        .map(|light| light.brightness)
+        .fold(0.0f32, f32::max);
+
+    assert!(
+        direct > ambient * 2.5,
+        "moonlight {direct} lux against {ambient} lux of ambient leaves no shadow to see"
+    );
+}
+
+#[test]
+fn the_lens_wets_faster_than_it_dries() {
+    use bevy_weather::rain_lens::{LensWetness, RainLensConfig, RainLensPlugin};
+
+    let mut app = simulation_app();
+    // The lens ships its shader as an embedded asset, so it needs somewhere to
+    // register it even though nothing is going to render.
+    app.add_plugins(bevy::asset::AssetPlugin::default());
+    app.add_plugins(RainLensPlugin);
+    // Hand control to the test; otherwise the procedural driver rewrites the
+    // weather underneath it.
+    app.world_mut().resource_mut::<ProceduralWeather>().enabled = false;
+    app.world_mut()
+        .resource_mut::<Weather>()
+        .set_immediate(WeatherPreset::Storm);
+    for _ in 0..400 {
+        app.update();
+    }
+    let wet = app.world().resource::<LensWetness>().0;
+    // A storm is heavy rain, not the heaviest possible, so the lens settles at
+    // that fraction of its maximum rather than at the maximum itself.
+    let target = app.world().resource::<Weather>().current.rain
+        * app.world().resource::<RainLensConfig>().max_wetness;
+    assert!(target > 0.2, "the storm preset barely rains: {target}");
+    assert!(
+        (wet - target).abs() < 0.02,
+        "the lens settled at {wet}, not the {target} the rain calls for"
+    );
+
+    app.world_mut()
+        .resource_mut::<Weather>()
+        .set_immediate(WeatherPreset::Clear);
+    // Same number of frames back the other way: it should still be damp,
+    // because water leaves at the speed of evaporation.
+    for _ in 0..400 {
+        app.update();
+    }
+    let drying = app.world().resource::<LensWetness>().0;
+    assert!(
+        drying > 0.05 && drying < wet,
+        "the lens dried instantly: {drying} from {wet}"
+    );
+}

@@ -44,6 +44,7 @@ the stars come out.
 | **Cloud shadows** | The deck's own shape, projected onto the ground along the sun as a light cookie, drifting with the same wind. |
 | **Volumetric fog** | Bevy's fog volumes and god rays, driven by weather and time of day. |
 | **Rain and snow** | GPU-resident particle fields. One draw call each, tens of thousands of particles, world-anchored. |
+| **Rain on the lens** | A screen-space post pass: droplets cling to the glass, run down it, leave broken trails and refract what is behind them. |
 | **Thunder** | Poisson-scheduled strikes with multi-stroke flash envelopes, scene lighting, in-cloud glow and speed-of-sound thunder delay. |
 | **Procedural weather** | Climate-driven, and a pure function of the clock. |
 
@@ -178,6 +179,8 @@ Every subsystem has its own resource, all mutable at runtime:
 | `CloudShadowConfig` | Ground shadows cast by the cloud deck |
 | `FogConfig` | Fog colour, visibility range and volume size |
 | `PrecipitationConfig` | Particle counts, sizes, speeds |
+| `RainLensConfig` | Water on the camera lens |
+| `MoonLightConfig` | Moonlight brightness, colour and shadows |
 | `ThunderConfig` | Strike rate, distance, flash |
 
 `WeatherConfig::quality` sets sensible sample counts for everything at once;
@@ -302,7 +305,7 @@ An interactive tour: fly around with `WASD` and the mouse, scrub the clock,
 cycle presets and climates, and toggle each subsystem. The on-screen panel lists
 the keys and shows the live weather state. `8` turns the meteor rate up to a
 shower, since at the honest rate you could watch for a long time without seeing
-one.
+one, and `9` toggles rain on the lens.
 
 ### Building for Windows from macOS or Linux
 
@@ -394,6 +397,8 @@ In rough order of leverage:
 | `AtmosphereConfig::environment_map_size` | Regenerated every frame; 512 buys nothing over 128 for ambient light. |
 | `CloudShadowConfig::resolution` | The shadow texture is rebuilt on the CPU: about 1.5 ms at 64, 6 ms at 128, 20 ms at 256, spread across the frames of `update_seconds` rather than landing on one. |
 | `CloudShadowConfig::enabled` | Off is free. |
+| `RainLensConfig::enabled` | A full-screen pass whenever the lens is wet; off costs nothing, and a dry lens does no render work at all. |
+| `MoonLightConfig::shadows` | A second set of cascaded shadow maps, rendered only while the moon is actually contributing. |
 | `PrecipitationConfig::particle_count` | Fill-rate bound, so it also scales with `box_size`. |
 
 `CloudConfig::adaptive_marching` exists only so the fast path can be measured
