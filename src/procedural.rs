@@ -246,7 +246,14 @@ impl ProceduralWeather {
         let cloud_density = (0.35 + cloud_coverage * 0.45 + humidity * 0.25).clamp(0.0, 1.0);
 
         // ---- Precipitation --------------------------------------------------
-        let precipitation = smoothstep(0.62, 0.98, cloud_coverage * (0.55 + humidity * 0.7));
+        // Two independent gates, multiplied. Full cloud cover is not the same
+        // as rain -- most overcast days stay dry -- so near-total cover is
+        // necessary but nowhere near sufficient; the airmass has to be close to
+        // saturated as well. Combining the two into a single blended term
+        // instead lets high cover alone carry the threshold, and then every
+        // grey day is a wet one, which is both wrong and miserable to play in.
+        let precipitation =
+            smoothstep(0.86, 1.0, cloud_coverage) * smoothstep(0.80, 0.97, humidity);
 
         // Below -2 C everything falls as snow, above +2 C everything as rain,
         // and in between you get sleet: both at once.
@@ -513,6 +520,48 @@ mod tests {
         }
         assert!(rain > 0.0);
         assert_eq!(snow, 0.0, "the tropics should never see snow");
+    }
+
+    #[test]
+    fn most_overcast_days_stay_dry() {
+        // Rain should be an event, not the default state of a cloudy sky.
+        let driver = temperate();
+        let mut time = WeatherTime::default();
+        let (mut overcast, mut wet) = (0, 0);
+        for _ in 0..20_000 {
+            time.advance(0.01);
+            let c = driver.evaluate(&time);
+            if c.cloud_coverage > 0.85 {
+                overcast += 1;
+                if c.precipitation() > 0.1 {
+                    wet += 1;
+                }
+            }
+        }
+        assert!(overcast > 500, "not enough overcast samples: {overcast}");
+        let fraction = wet as f32 / overcast as f32;
+        assert!(
+            fraction < 0.5,
+            "{:.0}% of overcast days were wet",
+            fraction * 100.0
+        );
+    }
+
+    #[test]
+    fn a_saturated_airmass_still_rains_properly() {
+        // The bar is higher, not unreachable: a wet climate must still deliver
+        // real rain rather than a permanent drizzle.
+        let driver = ProceduralWeather {
+            climate: Climate::OCEANIC,
+            ..Default::default()
+        };
+        let mut time = WeatherTime::default();
+        let mut heaviest = 0.0f32;
+        for _ in 0..20_000 {
+            time.advance(0.01);
+            heaviest = heaviest.max(driver.evaluate(&time).precipitation());
+        }
+        assert!(heaviest > 0.7, "heaviest rainfall was only {heaviest}");
     }
 
     #[test]

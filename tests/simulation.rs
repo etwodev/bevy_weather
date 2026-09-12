@@ -11,10 +11,12 @@ use bevy::app::App;
 use bevy::time::{Time, TimePlugin, TimeUpdateStrategy};
 use std::time::Duration;
 
+use bevy::light::{DirectionalLight, SunDisk};
 use bevy_weather::prelude::*;
 use bevy_weather::{
-    CorePlugin, celestial::CelestialBodies, procedural::ProceduralWeatherPlugin,
-    state::WeatherStatePlugin, time::WeatherTimePlugin, wind::WindPlugin,
+    CorePlugin, celestial::CelestialBodies, celestial::CelestialPlugin,
+    procedural::ProceduralWeatherPlugin, state::WeatherStatePlugin, time::WeatherTimePlugin,
+    wind::WindPlugin,
 };
 
 /// An app with everything that does not need a renderer.
@@ -269,4 +271,47 @@ fn a_full_year_of_simulation_never_produces_invalid_state() {
         let time = app.world().resource::<WeatherTime>();
         assert!((0.0..1.0).contains(&time.time_of_day));
     }
+}
+
+#[test]
+fn the_moon_light_suppresses_the_atmosphere_sun_disc() {
+    // Bevy draws a sun disc for every directional light, defaulting to
+    // `SunDisk::EARTH` when the component is absent. Without an explicit
+    // `SunDisk::OFF` the moon light paints a blazing sun at the moon's
+    // position, which sits on top of the real moon and hides its phase.
+    let mut app = simulation_app();
+    app.add_plugins(CelestialPlugin);
+    app.update();
+    app.update();
+
+    let mut moons = app.world_mut().query_filtered::<Option<&SunDisk>, (
+        bevy::ecs::query::With<MoonLight>,
+        bevy::ecs::query::With<DirectionalLight>,
+    )>();
+
+    let discs: Vec<_> = moons.iter(app.world()).collect();
+    assert_eq!(discs.len(), 1, "expected exactly one moon light");
+    let disc = discs[0].expect("the moon light needs an explicit SunDisk");
+    assert_eq!(
+        disc.intensity, 0.0,
+        "the moon light must not draw an atmospheric sun disc"
+    );
+}
+
+#[test]
+fn the_sun_light_does_draw_a_disc() {
+    let mut app = simulation_app();
+    app.add_plugins(CelestialPlugin);
+    app.update();
+    app.update();
+
+    let mut suns = app.world_mut().query_filtered::<Option<&SunDisk>, (
+        bevy::ecs::query::With<SunLight>,
+        bevy::ecs::query::With<DirectionalLight>,
+    )>();
+    let discs: Vec<_> = suns.iter(app.world()).collect();
+    assert_eq!(discs.len(), 1, "expected exactly one sun light");
+    let disc = discs[0].expect("the sun light should carry a SunDisk");
+    assert!(disc.intensity > 0.0);
+    assert!(disc.angular_size > 0.0);
 }

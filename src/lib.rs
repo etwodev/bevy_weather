@@ -22,7 +22,7 @@ use bevy::prelude::Update;
 /// Everything you normally need, in one `use`.
 pub mod prelude {
     pub use crate::atmosphere::AtmosphereConfig;
-    pub use crate::celestial::{CelestialBodies, MoonLight, SunLight};
+    pub use crate::celestial::{CelestialBodies, MoonLight, SunConfig, SunLight};
     pub use crate::clouds::CloudConfig;
     pub use crate::config::{Quality, WeatherCamera, WeatherConfig};
     pub use crate::fog::FogConfig;

@@ -16,6 +16,7 @@ use bevy::ecs::world::Ref;
 use bevy::light::atmosphere::ScatteringMedium;
 use bevy::light::{Atmosphere, AtmosphereEnvironmentMapLight};
 use bevy::pbr::{AtmosphereMode, AtmosphereSettings};
+use bevy::post_process::bloom::Bloom;
 use bevy::prelude::Entity;
 use bevy::reflect::Reflect;
 
@@ -27,7 +28,8 @@ use bevy::ecs::reflect::ReflectResource;
 use bevy::reflect::std_traits::ReflectDefault;
 
 /// Tuning for the atmosphere pass.
-#[derive(Resource, Debug, Clone, Reflect)]
+// No `Debug`: Bevy's `Bloom` does not implement it.
+#[derive(Resource, Clone, Reflect)]
 #[reflect(Resource, Default)]
 pub struct AtmosphereConfig {
     /// Spawn a planet entity with an Earth-like [`Atmosphere`] on startup.
@@ -63,6 +65,17 @@ pub struct AtmosphereConfig {
     /// Set [`Tonemapping`] on weather cameras. `None` leaves it alone.
     pub tonemapping: Option<Tonemapping>,
 
+    /// Add [`Bloom`] to weather cameras. `None` leaves bloom alone.
+    ///
+    /// This is not decoration. The sun's disc is several orders of magnitude
+    /// brighter than anything else in the frame, and without somewhere for that
+    /// energy to bleed it tonemaps to a flat white circle with a hard edge --
+    /// which is exactly what a real sun does not look like. Bloom is what turns
+    /// it back into glare. It also gives the moon and lightning their halos.
+    ///
+    /// Bloom requires an HDR camera, which the component pulls in for you.
+    pub bloom: Option<Bloom>,
+
     /// Farthest distance, in metres, at which aerial perspective is evaluated.
     pub aerial_view_max_distance: f32,
 }
@@ -76,6 +89,13 @@ impl Default for AtmosphereConfig {
             environment_light: true,
             exposure_ev100: Some(13.0),
             tonemapping: Some(Tonemapping::AcesFitted),
+            bloom: Some(Bloom {
+                // A little above `NATURAL`. The sun is the one thing in the
+                // frame that is genuinely blinding, and it needs enough bleed
+                // to read as glare rather than as a white sticker on the sky.
+                intensity: 0.24,
+                ..Bloom::NATURAL
+            }),
             aerial_view_max_distance: 32_000.0,
         }
     }
@@ -192,6 +212,9 @@ fn configure_cameras(
         }
         if let Some(tonemapping) = atmosphere.tonemapping {
             entity_commands.insert(tonemapping);
+        }
+        if let Some(bloom) = atmosphere.bloom.clone() {
+            entity_commands.insert(bloom);
         }
     }
 }

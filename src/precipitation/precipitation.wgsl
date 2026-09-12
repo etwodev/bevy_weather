@@ -136,7 +136,7 @@ fn vertex(vertex: Vertex) -> VertexOutput {
         let velocity = precipitation.wind.xyz - vec3(0.0, fall_speed, 0.0);
         up_axis = normalize(velocity);
         // A drop's apparent length grows with how fast it crosses the frame.
-        length_axis *= clamp(length(velocity) / 8.0, 0.35, 2.5);
+        length_axis *= clamp(length(velocity) / 12.0, 0.35, 1.6);
     }
 
     var right = cross(up_axis, to_eye);
@@ -155,7 +155,11 @@ fn vertex(vertex: Vertex) -> VertexOutput {
     let world = center + right * (local.x * width) + up_axis * (local.y * length_axis);
 
     out.position = view.clip_from_world * vec4(world, 1.0);
-    out.alpha = precipitation.shape.w * edge_fade;
+    // Vary opacity per drop. A field of identically-opaque streaks reads as a
+    // mesh laid over the screen; real rain has drops at every depth and every
+    // angle, and most of them you barely register.
+    let drop_variation = select(1.0, 0.25 + 0.75 * vertex.random.z, !is_snow);
+    out.alpha = precipitation.shape.w * edge_fade * drop_variation;
     // Face the streak toward the light a little, so rain glints when lit from
     // the side.
     out.shade = 1.0;
@@ -185,10 +189,12 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
         coverage = 1.0 - smoothstep(ragged * 0.45, ragged, r);
         coverage *= coverage;
     } else {
-        // A streak: sharp across, tapering to nothing at both ends.
+        // A streak: a thin bright core that falls off fast to either side, and
+        // tapers away at both ends. The cubic is what keeps it reading as a
+        // line of light rather than as a solid quad with soft edges.
         let across = 1.0 - abs(centred.x);
         let along = 1.0 - abs(centred.y);
-        coverage = across * across * smoothstep(0.0, 0.35, along);
+        coverage = across * across * across * smoothstep(0.0, 0.5, along);
     }
 
     if coverage <= 0.002 {

@@ -136,6 +136,7 @@ reach the camera, then attenuated for distance:
 ```rust,no_run
 # use bevy::prelude::*;
 # use bevy_weather::prelude::*;
+# #[cfg(feature = "audio")]
 fn setup_thunder(mut thunder: ResMut<ThunderConfig>, assets: Res<AssetServer>) {
     thunder.sound = Some(assets.load("sounds/thunder.ogg"));
 }
@@ -167,7 +168,8 @@ Every subsystem has its own resource, all mutable at runtime:
 | `WeatherTime` | Clock, latitude, axial tilt, moon phase offset |
 | `Weather` | Current and target conditions |
 | `ProceduralWeather` | The driver, climate and seed |
-| `AtmosphereConfig` | Scattering density, exposure, tonemapping |
+| `AtmosphereConfig` | Scattering density, exposure, tonemapping, bloom |
+| `SunConfig` | Sun disc size and brightness |
 | `StarConfig`, `GalaxyConfig`, `MoonConfig` | The night sky |
 | `CloudConfig` | Cloud look and raymarch cost |
 | `FogConfig` | Fog colour, visibility range and volume size |
@@ -224,6 +226,15 @@ Everything the shaders emit is in physical radiance and is multiplied by
   `AtmosphereConfig` sets `Exposure { ev100: 13.0 }` and ACES tonemapping on
   weather cameras by default. Set `exposure_ev100: None` to manage exposure
   yourself.
+* **The sun and moon are drawn larger than life.** Both are half a degree
+  across in reality — about twenty pixels at a typical field of view, too few to
+  show a lunar phase at all. `SunConfig::angular_radius` and
+  `MoonConfig::angular_radius` default to a little over twice that, and both
+  accept `DEFAULT_ANGULAR_RADIUS` if you want the true size.
+* **Glare comes from bloom, not from the sky shader.** `AtmosphereConfig::bloom`
+  is on by default and is doing most of the work of making the sun look like a
+  sun. A halo baked into the sky instead cannot be occluded by anything, so it
+  would shine straight through cloud that should have hidden it.
 * **The night sky is deliberately exaggerated.** A point star has no meaningful
   radiance at raster resolution — the value depends entirely on the solid angle
   of a pixel — and a real moonlit night is a fraction of a lux, which at a fixed

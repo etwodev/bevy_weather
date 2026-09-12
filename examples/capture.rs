@@ -7,6 +7,18 @@
 //! ```sh
 //! cargo run --example capture --release -- <output-directory>
 //! ```
+//!
+//! Two environment variables help when something looks wrong:
+//!
+//! * `BIG_MOON=1` renders the moon at about ten times its normal size, which is
+//!   the only practical way to check the phase, the terminator and the surface
+//!   detail -- at its real size it is twenty pixels across.
+//! * `NO_STARS=1` turns off the star field and galaxy, to tell whether a stray
+//!   bright pixel is a star or something else.
+//! * `NO_ATMO=1` disables the atmosphere pass, which separates what this
+//!   plugin's own shaders produce from what the atmosphere then does to it.
+//! * `WB=<n>` overrides `MoonConfig::white_balance`, for checking how far the
+//!   moon's colour moves between no correction and full.
 
 use bevy::asset::RenderAssetUsages;
 use bevy::camera::RenderTarget;
@@ -18,17 +30,148 @@ use bevy::window::WindowResolution;
 
 use bevy_weather::prelude::*;
 
-/// `(name, hour, preset, camera pitch in degrees)`
-const SHOTS: [(&str, f32, WeatherPreset, f32); 8] = [
-    ("01-dawn-clear", 6.2, WeatherPreset::Clear, 6.0),
-    ("02-noon-cumulus", 12.0, WeatherPreset::PartlyCloudy, 22.0),
-    ("03-afternoon-overcast", 15.0, WeatherPreset::Overcast, 14.0),
-    ("04-sunset-rain", 19.3, WeatherPreset::Rain, 8.0),
-    ("05-night-stars", 23.5, WeatherPreset::Clear, 34.0),
-    ("06-night-galaxy-up", 1.0, WeatherPreset::Clear, 65.0),
-    ("07-thunderstorm", 16.0, WeatherPreset::Thunderstorm, 18.0),
-    ("08-blizzard", 10.0, WeatherPreset::Blizzard, 6.0),
-];
+/// Where to point the camera for a shot.
+#[derive(Clone, Copy, PartialEq)]
+enum Aim {
+    /// Fixed yaw (radians) and pitch (degrees).
+    Fixed { yaw: f32, pitch: f32 },
+    /// Straight at the sun, wherever the clock has put it.
+    Sun,
+    /// Straight at the moon.
+    Moon,
+}
+
+/// One capture.
+struct Shot {
+    name: &'static str,
+    hour: f32,
+    preset: WeatherPreset,
+    aim: Aim,
+    /// Overrides `WeatherTime::moon_phase_offset` when set.
+    phase: Option<f32>,
+}
+
+const fn shot(name: &'static str, hour: f32, preset: WeatherPreset, aim: Aim) -> Shot {
+    Shot {
+        name,
+        hour,
+        preset,
+        aim,
+        phase: None,
+    }
+}
+
+const fn at_phase(mut s: Shot, phase: f32) -> Shot {
+    s.phase = Some(phase);
+    s
+}
+
+fn shots() -> Vec<Shot> {
+    let fixed = |yaw: f32, pitch: f32| Aim::Fixed { yaw, pitch };
+    vec![
+        shot("01-dawn-clear", 6.2, WeatherPreset::Clear, fixed(0.35, 6.0)),
+        shot(
+            "02-noon-cumulus",
+            12.0,
+            WeatherPreset::PartlyCloudy,
+            fixed(0.35, 22.0),
+        ),
+        shot(
+            "03-afternoon-overcast",
+            15.0,
+            WeatherPreset::Overcast,
+            fixed(0.35, 14.0),
+        ),
+        shot(
+            "04-sunset-rain",
+            19.3,
+            WeatherPreset::Rain,
+            fixed(0.35, 8.0),
+        ),
+        shot(
+            "05-night-stars",
+            23.5,
+            WeatherPreset::Clear,
+            fixed(0.35, 34.0),
+        ),
+        shot(
+            "06-night-galaxy-up",
+            1.0,
+            WeatherPreset::Clear,
+            fixed(0.35, 65.0),
+        ),
+        shot(
+            "07-thunderstorm",
+            16.0,
+            WeatherPreset::Thunderstorm,
+            fixed(0.35, 18.0),
+        ),
+        shot(
+            "08-blizzard",
+            10.0,
+            WeatherPreset::Blizzard,
+            fixed(0.35, 6.0),
+        ),
+        // Paired shots. In each pair the camera is on the same body; the first
+        // should show it, the second must not, because weather is in the way.
+        shot("09-sun-glare", 8.0, WeatherPreset::FewClouds, Aim::Sun),
+        shot(
+            "10-sun-behind-storm",
+            8.0,
+            WeatherPreset::Thunderstorm,
+            Aim::Sun,
+        ),
+        shot("11-moon-gibbous", 23.0, WeatherPreset::Clear, Aim::Moon),
+        shot(
+            "12-moon-behind-storm",
+            23.0,
+            WeatherPreset::Thunderstorm,
+            Aim::Moon,
+        ),
+        // Phases, to check the terminator falls where the geometry says it
+        // should rather than being painted on.
+        at_phase(
+            shot("13-moon-crescent", 20.0, WeatherPreset::Clear, Aim::Moon),
+            0.10,
+        ),
+        at_phase(
+            shot("14-moon-quarter", 18.0, WeatherPreset::Clear, Aim::Moon),
+            0.25,
+        ),
+        at_phase(
+            shot("15-moon-full", 1.0, WeatherPreset::Clear, Aim::Moon),
+            0.50,
+        ),
+        // Fog, at ground level where you would actually stand in it.
+        shot("16-fog-midday", 12.0, WeatherPreset::Fog, fixed(0.35, 2.0)),
+        shot("17-fog-dawn", 6.5, WeatherPreset::Fog, fixed(0.35, 2.0)),
+        shot(
+            "18-misty-morning",
+            7.5,
+            WeatherPreset::MistyMorning,
+            fixed(0.35, 4.0),
+        ),
+        // How far into the night the stars take to arrive.
+        shot(
+            "19-stars-dusk",
+            21.0,
+            WeatherPreset::Clear,
+            fixed(0.35, 40.0),
+        ),
+        shot(
+            "20-stars-late",
+            2.0,
+            WeatherPreset::Clear,
+            fixed(0.35, 40.0),
+        ),
+        shot(
+            "21-stars-moonlit",
+            23.0,
+            WeatherPreset::Clear,
+            fixed(2.6, 40.0),
+        ),
+    ]
+}
 
 /// Frames to let each configuration settle before capturing. The atmosphere
 /// LUTs and the environment map both need a few frames.
@@ -46,6 +189,8 @@ const CAPTURE_SIZE: (u32, u32) = (1280, 720);
 
 #[derive(Resource)]
 struct Capture {
+    /// The shot list, built once at startup.
+    shots: Vec<Shot>,
     directory: String,
     index: usize,
     frame: u32,
@@ -86,6 +231,7 @@ fn main() {
             },
             config: WeatherConfig {
                 quality: Quality::High,
+                atmosphere: std::env::var("NO_ATMO").is_err(),
                 ..default()
             },
             ..default()
@@ -102,13 +248,32 @@ struct CaptureDirectory(String);
 #[derive(Component)]
 struct CaptureCamera;
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a Bevy startup system building the harness's whole scene"
+)]
 fn setup(
     mut commands: Commands,
+    mut moon: ResMut<MoonConfig>,
+    mut stars: ResMut<StarConfig>,
+    mut galaxy: ResMut<GalaxyConfig>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
     directory: Res<CaptureDirectory>,
 ) {
+    // Blow the moon up so its phase, terminator and maria can be inspected.
+    if std::env::var("BIG_MOON").is_ok() {
+        moon.angular_radius = 0.12;
+    }
+    if let Ok(v) = std::env::var("WB") {
+        moon.white_balance = v.parse().unwrap_or(1.0);
+    }
+    if std::env::var("NO_STARS").is_ok() {
+        stars.enabled = false;
+        galaxy.enabled = false;
+    }
+
     let mut target = Image::new_target_texture(
         CAPTURE_SIZE.0,
         CAPTURE_SIZE.1,
@@ -119,6 +284,7 @@ fn setup(
     let target = images.add(target);
 
     commands.insert_resource(Capture {
+        shots: shots(),
         directory: directory.0.clone(),
         index: 0,
         frame: 0,
@@ -167,7 +333,14 @@ fn run_capture(
     mut cameras: Query<&mut Transform, With<CaptureCamera>>,
     mut exit: MessageWriter<AppExit>,
 ) {
-    let Some(&(name, hour, preset, pitch)) = SHOTS.get(capture.index) else {
+    let Some(&Shot {
+        name,
+        hour,
+        preset,
+        aim,
+        phase,
+    }) = capture.shots.get(capture.index)
+    else {
         // Screenshot readback is asynchronous: the GPU copy lands a few frames
         // after it is requested, and `save_to_disk` only runs then. Exiting the
         // moment the last shot is *requested* closes the channel underneath it
@@ -181,17 +354,30 @@ fn run_capture(
 
     if capture.frame == 0 {
         weather_time.set_hour(hour);
+        // Reset rather than leaving a previous shot's override in place.
+        weather_time.moon_phase_offset = phase.unwrap_or(0.34);
         weather.set_immediate(preset);
+
+        // The bodies resource is only refreshed by the weather schedule, so
+        // recompute it here rather than aiming at last frame's sun.
+        let sky = bevy_weather::celestial::compute_celestial(&weather_time);
+        let eye = Vec3::new(0.0, 4.0, 40.0);
         for mut transform in &mut cameras {
-            // Face north-ish and tilt up by the requested amount.
-            *transform = Transform::from_xyz(0.0, 4.0, 40.0).with_rotation(Quat::from_euler(
-                EulerRot::YXZ,
-                0.35,
-                pitch.to_radians(),
-                0.0,
-            ));
+            *transform = match aim {
+                Aim::Fixed { yaw, pitch } => Transform::from_translation(eye).with_rotation(
+                    Quat::from_euler(EulerRot::YXZ, yaw, pitch.to_radians(), 0.0),
+                ),
+                Aim::Sun => Transform::from_translation(eye).looking_to(sky.sun_direction, Vec3::Y),
+                Aim::Moon => {
+                    Transform::from_translation(eye).looking_to(sky.moon_direction, Vec3::Y)
+                }
+            };
         }
-        info!("capturing {name} at {hour:.1}h ({})", preset.name());
+        info!(
+            "capturing {name} at {hour:.1}h ({}), moon altitude {:.2}",
+            preset.name(),
+            sky.moon_altitude,
+        );
     }
 
     capture.frame += 1;

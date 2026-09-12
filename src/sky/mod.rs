@@ -81,6 +81,13 @@ pub struct StarConfig {
     pub brightness: f32,
     /// Fraction of cells that actually contain a star, `0.0..=1.0`.
     pub occupancy: f32,
+    /// How steeply brightness falls off across the population.
+    ///
+    /// Real star counts rise steeply toward the faint end, and a uniform
+    /// variate raised to this power reproduces that. Too high and every star is
+    /// near-invisible, so the sky reads as grey dust instead of as stars; too
+    /// low and they are all equally bright, which looks like a texture.
+    pub magnitude_falloff: f32,
     /// Apparent size of a star, as a fraction of a grid cell.
     pub size: f32,
     /// How strongly stars are tinted by temperature, `0.0..=1.0`.
@@ -97,10 +104,11 @@ impl Default for StarConfig {
         Self {
             enabled: true,
             density: 180.0,
-            brightness: 2.2,
-            occupancy: 0.35,
-            size: 0.055,
+            brightness: 4.0,
+            occupancy: 0.30,
+            size: 0.07,
             color_variation: 0.6,
+            magnitude_falloff: 2.2,
             twinkle_speed: 2.4,
             twinkle_amount: 0.45,
         }
@@ -162,27 +170,67 @@ pub struct MoonConfig {
     /// Draw the moon at all.
     pub enabled: bool,
     /// Brightness of the lit surface.
+    ///
+    /// Tuned so the sunlit side lands just under the clipping point at the
+    /// exposure [`AtmosphereConfig`](crate::atmosphere::AtmosphereConfig) sets.
+    /// Pushing it higher does not make the moon look brighter -- it is already
+    /// the brightest thing in a night frame -- it just crushes the whole disc
+    /// to flat white and takes the phase, the terminator and the maria with it.
+    /// Bloom is what should carry the sense of brightness instead.
     pub brightness: f32,
-    /// Apparent radius in radians. The real moon is about `0.00465`.
+    /// Apparent radius in radians.
+    ///
+    /// The real moon is `0.00465` -- about half a degree across, which is far
+    /// smaller than anyone remembers it being, and at a typical field of view
+    /// covers barely a dozen pixels: too few to show a phase at all.
+    ///
+    /// The default is enlarged to a little over twice that, which is enough for
+    /// the terminator and the maria to read while still looking like the moon.
+    /// It matches [`SunConfig::angular_radius`](crate::celestial::SunConfig::angular_radius),
+    /// as the real pair very nearly do -- which is the coincidence that makes
+    /// total eclipses possible. Set it to
+    /// [`DEFAULT_ANGULAR_RADIUS`](crate::celestial::DEFAULT_ANGULAR_RADIUS) for
+    /// the true size.
     pub angular_radius: f32,
     /// Strength of earthshine on the unlit part of the disc, `0.0..=1.0`.
     /// This is what makes "the old moon in the new moon's arms".
     pub earthshine: f32,
     /// Contrast of the procedural maria and craters, `0.0..=1.0`.
     pub surface_detail: f32,
-    /// Tint of the moon's surface.
+    /// Tint of the moon's surface. Roughly the real thing: a warm pale grey.
     pub tint: Color,
+
+    /// How strongly to cancel the atmosphere's reddening. `0.0` disables it.
+    ///
+    /// The atmosphere pass reddens the moon by the correct amount for its
+    /// altitude, and at the twenty to forty degrees where the moon actually
+    /// spends most of its time that is a *lot* -- two to three air masses, more
+    /// than enough to halve the blue channel. Rendered without correction, the
+    /// moon is orange nearly every night.
+    ///
+    /// A real observer does not see that, because the eye white-balances to
+    /// what it is looking at. This is the stand-in for an adaptation the
+    /// renderer has no way to perform: the moon's tint is pre-divided by an
+    /// estimate of the extinction it is about to suffer, so it comes out neutral
+    /// at the altitudes it is normally seen at.
+    ///
+    /// The correction saturates a little below twenty degrees of elevation, so
+    /// a moon actually sitting on the horizon still goes the deep orange it
+    /// should. `1.0` is the tuned default; higher over-corrects toward a cold
+    /// moon, and `0.0` gives you the unmodified physics.
+    pub white_balance: f32,
 }
 
 impl Default for MoonConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            brightness: 10.0,
-            angular_radius: crate::celestial::DEFAULT_ANGULAR_RADIUS,
+            brightness: 3.2,
+            angular_radius: 0.0105,
             earthshine: 0.12,
             surface_detail: 0.7,
-            tint: Color::srgb(0.96, 0.95, 0.90),
+            tint: Color::srgb(0.96, 0.95, 0.93),
+            white_balance: 1.0,
         }
     }
 }
@@ -207,7 +255,8 @@ pub struct SkyUniform {
     pub moon_color: Vec4,
     /// `x`: density. `y`: brightness. `z`: twinkle speed. `w`: size.
     pub star_params: Vec4,
-    /// `x`: colour spread. `y`: occupancy. `z`: twinkle depth. `w`: unused.
+    /// `x`: colour spread. `y`: occupancy. `z`: twinkle depth.
+    /// `w`: magnitude falloff.
     pub star_params2: Vec4,
     /// `x`: brightness. `y`: noise scale. `z`: dust. `w`: band tightness.
     pub galaxy_params: Vec4,
@@ -240,6 +289,7 @@ pub struct SkyUniform {
     /// `rgb`: ground-fog colour, in post-exposure units.
     pub fog_color: Vec4,
     /// `x`: fog extinction per world unit. `y`: fog layer height.
+    /// `z`: forward-scattering glow. `w`: glow exponent.
     pub fog_params: Vec4,
     /// `x`: time. `y`: planet radius. `z`: units per metre. `w`: feature flags.
     pub misc: Vec4,
@@ -423,18 +473,74 @@ fn fullscreen_triangle() -> Mesh {
     .with_inserted_indices(Indices::U32(vec![0, 1, 2]))
 }
 
+/// A per-channel gain that cancels most of the atmospheric reddening a body at
+/// `altitude` is about to pick up.
+///
+/// `altitude` is the sine of the elevation angle, matching
+/// [`CelestialBodies::moon_altitude`]. `strength` scales the correction: `1.0`
+/// is the tuned default and `0.0` disables it.
+///
+/// The result is normalised against luminance rather than against its largest
+/// channel, so it shifts hue without changing how bright the body appears.
+/// Normalising on the peak instead would leave every channel at or below one
+/// and quietly darken the moon as the correction grew.
+pub fn atmospheric_white_balance(altitude: f32, strength: f32) -> Vec3 {
+    let strength = strength.clamp(0.0, 4.0);
+    if strength <= 0.0 {
+        return Vec3::ONE;
+    }
+
+    // Effective optical depth of the whole column at the zenith, per channel.
+    //
+    // Fitted against what Bevy's atmosphere actually does rather than taken
+    // from the Rayleigh coefficients directly: the pass also carries a Mie term
+    // and an ozone term, and integrates a real density profile, so the textbook
+    // Rayleigh figures come out about thirty percent short.
+    const ZENITH_OPTICAL_DEPTH: Vec3 = Vec3::new(0.057, 0.134, 0.329);
+
+    // A softened `1 / sin(elevation)`, capped. The cap is the important part:
+    // real air mass runs away toward the horizon -- better than twenty at the
+    // horizon itself -- and a correction that tracked it would turn a moonrise
+    // blue. Saturating at three air masses corrects the altitudes the moon is
+    // usually at and leaves the deep reddening of a low moon intact, which is
+    // the one time it is worth seeing.
+    const MAX_CORRECTED_AIR_MASS: f32 = 3.0;
+    let air_mass = (1.0 / (altitude.max(0.0) + 0.045)).min(MAX_CORRECTED_AIR_MASS);
+    let optical_depth = ZENITH_OPTICAL_DEPTH * air_mass;
+
+    // The inverse of the transmittance it is about to be multiplied by.
+    let gain = Vec3::new(
+        (optical_depth.x * strength).exp(),
+        (optical_depth.y * strength).exp(),
+        (optical_depth.z * strength).exp(),
+    );
+    // Rec. 709 luminance weights.
+    const LUMA: Vec3 = Vec3::new(0.2126, 0.7152, 0.0722);
+    gain / gain.dot(LUMA).max(1e-6)
+}
+
 /// Builds the star frame rotation for a given clock.
 ///
 /// Returns the matrix that takes a world-space direction into the frame the
-/// stars are fixed in. Because it is built from local sidereal time rather than
-/// solar time, the star field drifts about four minutes a day against the sun —
-/// so a given constellation returns to the same place a little earlier each
-/// night, exactly as it does in reality.
+/// stars are fixed in.
+///
+/// The angle is *local sidereal time*, not solar time, and it accumulates
+/// continuously. That one detail is what sets the star field's rate: the sky
+/// turns once per sidereal day (23h56m), so stars sweep at 15.041 degrees an
+/// hour, very slightly faster than the sun's 15. The moon, meanwhile, is
+/// falling behind at about 13 degrees a day, so it drifts eastward through the
+/// constellations and rises roughly fifty minutes later each night.
+///
+/// Advancing this by whole days only -- stepping it at midnight rather than
+/// integrating it -- would pin the stars to the *solar* rate and lock them to
+/// the moon, which is exactly the giveaway that a sky is faked.
 pub fn star_frame_from_world(time: &WeatherTime) -> Mat3 {
     let latitude = time.latitude.to_radians();
-    // Solar hour angle plus the sun's own yearly march around the sky.
-    let sidereal = core::f32::consts::TAU
-        * ((time.time_of_day - 0.5) + (time.day as f32 / DAYS_PER_YEAR).fract());
+    // Solar hour angle plus the sun's own continuous yearly march around the
+    // sky. `f64` for the year term: after a few in-game years an `f32` can no
+    // longer resolve a single minute of it.
+    let year_fraction = (time.elapsed_days() / DAYS_PER_YEAR as f64).rem_euclid(1.0) as f32;
+    let sidereal = core::f32::consts::TAU * ((time.time_of_day - 0.5) + year_fraction);
     let (sin_lst, cos_lst) = sidereal.sin_cos();
     let (sin_lat, cos_lat) = latitude.sin_cos();
 
@@ -604,7 +710,8 @@ pub fn build_uniform(
     let sun = bodies.sun_direction;
     let moon_dir = bodies.moon_direction;
     let sun_color = bodies.sun_color.to_vec3();
-    let moon_tint = moon.tint.to_linear().to_vec3();
+    let moon_tint = moon.tint.to_linear().to_vec3()
+        * atmospheric_white_balance(bodies.moon_altitude, moon.white_balance);
 
     SkyUniform {
         sun_direction: sun.extend(bodies.sun_angular_radius),
@@ -622,7 +729,7 @@ pub fn build_uniform(
             stars.color_variation.clamp(0.0, 1.0),
             stars.occupancy.clamp(0.0, 1.0),
             stars.twinkle_amount.clamp(0.0, 1.0),
-            0.0,
+            stars.magnitude_falloff.max(0.1),
         ),
 
         galaxy_params: Vec4::new(
@@ -687,8 +794,8 @@ pub fn build_uniform(
         fog_params: Vec4::new(
             fog.extinction_at(conditions.fog),
             fog.volume_height.max(0.1),
-            0.0,
-            0.0,
+            fog.sun_glow.max(0.0),
+            fog.sun_glow_exponent.max(1.0),
         ),
 
         misc: Vec4::new(
@@ -714,6 +821,71 @@ mod tests {
     use crate::celestial::compute_celestial;
 
     #[test]
+    fn white_balance_is_neutral_when_disabled() {
+        for altitude in [-1.0f32, 0.0, 0.3, 1.0] {
+            assert_eq!(atmospheric_white_balance(altitude, 0.0), Vec3::ONE);
+        }
+    }
+
+    #[test]
+    fn white_balance_preserves_luminance() {
+        // It is a hue shift, not a dimmer. If the correction changed overall
+        // brightness, the moon would fade as it sank -- on top of the fading
+        // the atmosphere is already doing.
+        const LUMA: Vec3 = Vec3::new(0.2126, 0.7152, 0.0722);
+        for i in 0..=20 {
+            let altitude = i as f32 / 20.0;
+            let gain = atmospheric_white_balance(altitude, 1.0);
+            assert!(
+                (gain.dot(LUMA) - 1.0).abs() < 1e-4,
+                "luminance drifted: {gain:?}"
+            );
+            assert!(gain.min_element() > 0.0);
+        }
+    }
+
+    #[test]
+    fn white_balance_pushes_blue_up_not_red() {
+        // It has to counteract reddening, so blue must be the channel that is
+        // held at full and red the one that is pulled down.
+        let gain = atmospheric_white_balance(0.35, 1.0);
+        assert!(gain.z > gain.y, "{gain:?}");
+        assert!(gain.y > gain.x, "{gain:?}");
+    }
+
+    #[test]
+    fn white_balance_works_hardest_where_the_air_is_thickest() {
+        let high = atmospheric_white_balance(1.0, 1.0);
+        let low = atmospheric_white_balance(0.2, 1.0);
+        // A lower body needs more correction, so the gap it opens between the
+        // blue and red channels is wider.
+        assert!(
+            low.z / low.x > high.z / high.x,
+            "high {high:?}, low {low:?}"
+        );
+    }
+
+    #[test]
+    fn white_balance_lets_a_horizon_moon_stay_orange() {
+        // The correction understates the air mass near the horizon on purpose.
+        // If it cancelled everything there, a moonrise would be white, and the
+        // one time the reddening is worth seeing is the one time it would be
+        // gone.
+        let horizon = atmospheric_white_balance(0.0, 1.0);
+        let typical = atmospheric_white_balance(0.35, 1.0);
+        // Saturated: a body on the horizon gets no more correction than one
+        // comfortably above it, so its extra reddening survives.
+        assert!(
+            horizon.z / horizon.x < 3.0,
+            "the horizon correction is too aggressive: {horizon:?}"
+        );
+        assert!(
+            (horizon.z / horizon.x) >= (typical.z / typical.x) - 1e-4,
+            "the correction should not shrink toward the horizon"
+        );
+    }
+
+    #[test]
     fn star_frame_is_a_rotation() {
         let mut time = WeatherTime::default();
         for _ in 0..200 {
@@ -731,6 +903,130 @@ mod tests {
             }
             assert!((m.determinant() - 1.0).abs() < 1e-4, "not a rotation");
         }
+    }
+
+    /// Angle swept about the celestial pole between two directions.
+    fn swept_about_pole(a: Vec3, b: Vec3, pole: Vec3) -> f32 {
+        let flatten = |v: Vec3| (v - pole * v.dot(pole)).normalize();
+        flatten(a).angle_between(flatten(b))
+    }
+
+    fn celestial_pole(latitude_degrees: f32) -> Vec3 {
+        let latitude = latitude_degrees.to_radians();
+        Vec3::new(0.0, latitude.sin(), -latitude.cos())
+    }
+
+    #[test]
+    fn stars_sweep_at_the_sidereal_rate() {
+        // A sidereal day is 23h56m, so the sky turns 15.041 degrees an hour --
+        // not the 15.0 of solar time.
+        let mut time = WeatherTime {
+            latitude: 45.0,
+            ..Default::default()
+        };
+        time.set_hour(22.0);
+
+        let star = Vec3::new(0.6, 0.3, -0.74).normalize();
+        let before = star_frame_from_world(&time).transpose() * star;
+        time.advance(1.0 / 24.0);
+        let after = star_frame_from_world(&time).transpose() * star;
+
+        let swept = swept_about_pole(before, after, celestial_pole(45.0)).to_degrees();
+        assert!(
+            (swept - 15.041).abs() < 0.02,
+            "stars swept {swept} deg/hour, expected 15.041"
+        );
+    }
+
+    #[test]
+    fn the_moon_falls_behind_the_stars() {
+        // The moon orbits eastward, so it lags the star field by about half a
+        // degree an hour. If the two sweep at the same rate, the moon is nailed
+        // to the constellations and the sky reads as fake.
+        let mut time = WeatherTime {
+            latitude: 45.0,
+            moon_phase_offset: 0.5,
+            ..Default::default()
+        };
+        time.set_hour(22.0);
+
+        let star = Vec3::new(0.6, 0.3, -0.74).normalize();
+        let star_before = star_frame_from_world(&time).transpose() * star;
+        let moon_before = compute_celestial(&time).moon_direction;
+
+        time.advance(1.0 / 24.0);
+
+        let star_after = star_frame_from_world(&time).transpose() * star;
+        let moon_after = compute_celestial(&time).moon_direction;
+
+        let pole = celestial_pole(45.0);
+        let star_swept = swept_about_pole(star_before, star_after, pole).to_degrees();
+        let moon_swept = swept_about_pole(moon_before, moon_after, pole).to_degrees();
+
+        assert!(
+            star_swept > moon_swept + 0.4,
+            "stars swept {star_swept}, moon swept {moon_swept} -- too close together"
+        );
+        assert!(
+            (moon_swept - 14.492).abs() < 0.05,
+            "moon swept {moon_swept} deg/hour, expected about 14.49"
+        );
+    }
+
+    #[test]
+    fn the_moon_drifts_a_full_lap_through_the_stars_each_month() {
+        // Over one synodic month the moon should come back to the same place
+        // relative to the sun, having lapped the constellations once.
+        let mut time = WeatherTime {
+            latitude: 45.0,
+            moon_phase_offset: 0.0,
+            ..Default::default()
+        };
+        let pole = celestial_pole(45.0);
+
+        let star = Vec3::new(0.6, 0.3, -0.74).normalize();
+        let star_start = star_frame_from_world(&time).transpose() * star;
+        let moon_start = compute_celestial(&time).moon_direction;
+        let start_gap = swept_about_pole(star_start, moon_start, pole);
+
+        // A quarter of a month is enough to show a large, unambiguous drift.
+        time.advance(crate::time::SYNODIC_MONTH_DAYS / 4.0);
+        let star_end = star_frame_from_world(&time).transpose() * star;
+        let moon_end = compute_celestial(&time).moon_direction;
+        let end_gap = swept_about_pole(star_end, moon_end, pole);
+
+        assert!(
+            (end_gap - start_gap).abs().to_degrees() > 45.0,
+            "moon barely moved against the stars: {} -> {} deg",
+            start_gap.to_degrees(),
+            end_gap.to_degrees()
+        );
+    }
+
+    #[test]
+    fn sidereal_time_has_no_midnight_jump() {
+        // Stepping the year term once a day rather than integrating it puts a
+        // visible lurch in the sky at midnight.
+        let mut time = WeatherTime {
+            latitude: 45.0,
+            day: 40,
+            ..Default::default()
+        };
+        time.set_hour(23.999);
+        let star = Vec3::new(0.6, 0.3, -0.74).normalize();
+        let before = star_frame_from_world(&time).transpose() * star;
+
+        time.advance(0.002 / 24.0);
+        let after = star_frame_from_world(&time).transpose() * star;
+
+        // Two thousandths of an hour of genuine sidereal rotation is 0.03
+        // degrees. A day's worth of the year term arriving in one step would be
+        // nearly a whole degree, which is the failure this guards against.
+        let moved = before.angle_between(after).to_degrees();
+        assert!(
+            moved < 0.2,
+            "the sky lurched {moved} degrees across midnight"
+        );
     }
 
     #[test]

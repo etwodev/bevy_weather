@@ -2,12 +2,13 @@
 
 use bevy::app::{App, Plugin, Update};
 use bevy::color::{Color, LinearRgba, Mix};
+use bevy::ecs::change_detection::DetectChanges;
 use bevy::ecs::component::Component;
 use bevy::ecs::query::{With, Without};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::IntoScheduleConfigs;
 use bevy::ecs::system::{Commands, Query, Res, ResMut};
-use bevy::light::{AmbientLight, DirectionalLight, VolumetricLight, light_consts::lux};
+use bevy::light::{AmbientLight, DirectionalLight, SunDisk, VolumetricLight, light_consts::lux};
 use bevy::math::Vec3;
 use bevy::prelude::Entity;
 use bevy::reflect::Reflect;
@@ -29,6 +30,46 @@ const DRACONIC_MONTH_DAYS: f32 = 27.212_22;
 
 /// Angular radius of the sun and moon as seen from Earth, in radians (~0.26°).
 pub const DEFAULT_ANGULAR_RADIUS: f32 = 0.004_65;
+
+/// How the sun's disc is drawn.
+///
+/// The disc itself is rendered by Bevy's atmosphere pass from a [`SunDisk`]
+/// component, so this is really just a convenient place to configure it
+/// alongside everything else.
+#[derive(Resource, Debug, Clone, Reflect)]
+#[reflect(Resource, Default)]
+pub struct SunConfig {
+    /// Draw a visible disc at all. With this off you still get sunlight and
+    /// atmospheric scattering, just no disc.
+    pub disk: bool,
+
+    /// Angular *radius* of the disc, in radians.
+    ///
+    /// The real sun is `0.00465` -- the same half a degree as the moon, which
+    /// is why a total eclipse works at all. As with the moon, the default is
+    /// enlarged, because a physically-sized sun on a monitor is a speck.
+    ///
+    /// Note that Bevy's [`SunDisk`] is specified as a *diameter*; this is
+    /// halved for you.
+    pub angular_radius: f32,
+
+    /// Brightness multiplier for the disc. `1.0` is physically correct.
+    ///
+    /// The sun's true radiance is several orders of magnitude past anything
+    /// else on screen, so this mostly controls how far the glare bleeds once
+    /// bloom gets hold of it.
+    pub disk_intensity: f32,
+}
+
+impl Default for SunConfig {
+    fn default() -> Self {
+        Self {
+            disk: true,
+            angular_radius: 0.0105,
+            disk_intensity: 1.0,
+        }
+    }
+}
 
 /// Marks the directional light the plugin steers as the sun.
 ///
@@ -176,7 +217,9 @@ pub struct CelestialPlugin;
 impl Plugin for CelestialPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<CelestialBodies>()
+            .init_resource::<SunConfig>()
             .register_type::<CelestialBodies>()
+            .register_type::<SunConfig>()
             .register_type::<SunLight>()
             .register_type::<MoonLight>()
             .add_systems(
@@ -195,6 +238,7 @@ fn update_celestial_bodies(mut bodies: ResMut<CelestialBodies>, time: Res<Weathe
 fn spawn_lights(
     mut commands: Commands,
     config: Res<WeatherConfig>,
+    sun_config: Res<SunConfig>,
     suns: Query<(), With<SunLight>>,
     moons: Query<(), With<MoonLight>>,
 ) {
@@ -212,6 +256,7 @@ fn spawn_lights(
                 ..Default::default()
             },
             VolumetricLight,
+            sun_disk(&sun_config),
             Transform::default(),
         ));
     }
@@ -225,8 +270,27 @@ fn spawn_lights(
                 ..Default::default()
             },
             VolumetricLight,
+            // Not optional. Bevy's atmosphere draws a sun disc for every
+            // directional light, and a light with no `SunDisk` component falls
+            // back to `SunDisk::EARTH` -- so the moon light gets a second,
+            // blazing white disc painted at the moon's exact position, sitting
+            // on top of the real moon and hiding its phase completely. The
+            // moon's own disc is drawn by the sky shader.
+            SunDisk::OFF,
             Transform::default(),
         ));
+    }
+}
+
+/// The [`SunDisk`] a [`SunConfig`] asks for.
+fn sun_disk(config: &SunConfig) -> SunDisk {
+    if !config.disk || config.disk_intensity <= 0.0 {
+        return SunDisk::OFF;
+    }
+    SunDisk {
+        // Bevy measures the disc as a diameter.
+        angular_size: config.angular_radius.max(0.0) * 2.0,
+        intensity: config.disk_intensity,
     }
 }
 
@@ -253,7 +317,12 @@ const NIGHT_AMBIENT_LUX: f32 = 1_800.0;
 type SunQuery<'w, 's> = Query<
     'w,
     's,
-    (&'static mut Transform, &'static mut DirectionalLight),
+    (
+        Entity,
+        &'static mut Transform,
+        &'static mut DirectionalLight,
+        Option<&'static SunDisk>,
+    ),
     (With<SunLight>, Without<MoonLight>),
 >;
 
@@ -265,10 +334,15 @@ type MoonQuery<'w, 's> = Query<
     (With<MoonLight>, Without<SunLight>),
 >;
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a Bevy system steering both lights and the ambient term"
+)]
 fn drive_lights(
     mut commands: Commands,
     bodies: Res<CelestialBodies>,
     config: Res<WeatherConfig>,
+    sun_config: Res<SunConfig>,
     weather: Res<Weather>,
     cameras: Query<Entity, With<WeatherCamera>>,
     mut sun: SunQuery,
@@ -279,13 +353,21 @@ fn drive_lights(
     }
 
     let cloudiness = weather.current.cloud_coverage * weather.current.cloud_density;
+    // How much light survives the deck depends on how far down through it the
+    // light has to come, not just on how much of the sky it covers. A seven
+    // hundred metre stratus deck is a grey day; a four kilometre cumulonimbus
+    // is dark enough to turn the streetlights on, and without this term the two
+    // render identically.
+    let depth = remap01(weather.current.cloud_thickness, 600.0, 4_000.0);
+    let opacity = cloudiness * (0.55 + 0.45 * depth);
     // Thick cloud turns direct sunlight into diffuse skylight rather than
     // destroying it, so what it takes off the directional light is put back on
     // the ambient term below.
-    let overcast = 1.0 - 0.93 * cloudiness;
+    let overcast = 1.0 - 0.95 * opacity;
     let scale = config.light_intensity_scale.max(0.0);
 
-    for (mut transform, mut light) in &mut sun {
+    let disk = sun_disk(&sun_config);
+    for (entity, mut transform, mut light, existing_disk) in &mut sun {
         // A directional light shines along its local `-Z`, so it must look
         // *away* from the body it represents.
         if bodies.sun_direction.y > -0.999 {
@@ -295,6 +377,12 @@ fn drive_lights(
         let visibility = remap01(bodies.sun_altitude, -0.02, 0.06);
         light.illuminance = lux::RAW_SUNLIGHT * visibility * overcast * scale;
         light.color = Color::LinearRgba(bodies.sun_color);
+
+        // Only rewrite when something actually changed, so a user adjusting
+        // `SunDisk` by hand on their own light is not fought every frame.
+        if existing_disk.is_none() || sun_config.is_changed() {
+            commands.entity(entity).insert(disk.clone());
+        }
     }
 
     for (mut transform, mut light) in &mut moon {
@@ -315,7 +403,10 @@ fn drive_lights(
     // The diffuse term the atmosphere's environment map cannot know about:
     // light bounced around by the cloud deck, plus a night-time floor.
     let night = 1.0 - bodies.daylight;
-    let overcast_ambient = OVERCAST_AMBIENT_LUX * cloudiness * bodies.daylight;
+    // The same depth term: light that has been through four kilometres of
+    // cloud arrives diffuse *and* greatly reduced.
+    let overcast_ambient =
+        OVERCAST_AMBIENT_LUX * cloudiness * bodies.daylight * (1.0 - 0.6 * depth);
     let night_ambient = NIGHT_AMBIENT_LUX * night * (0.25 + 0.75 * bodies.moon_illumination);
     let brightness = (overcast_ambient + night_ambient) * scale;
     // Overcast light is grey; night is blue, because what little there is has

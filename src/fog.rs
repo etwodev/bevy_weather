@@ -55,30 +55,25 @@ pub struct FogConfig {
 
     /// Ceiling on the optical depth across the fog volume.
     ///
-    /// The volume's actual density is derived from the same visibility that
-    /// drives [`DistanceFog`]; this only stops the very thickest fog turning
-    /// the volume into an opaque box whose edges you can see.
-    pub max_optical_depth: f32,
-
-    /// How bright the fog glows, in post-exposure units, at full daylight.
+    /// Deliberately small, because the volumetric pass is only here for god
+    /// rays. The visible loss of contrast is done by [`DistanceFog`] and the
+    /// sky fade, which agree with each other exactly.
     ///
-    /// Around `0.6` is a convincing daytime white-out; `0.0` gives fog that
-    /// only absorbs, which reads as smoke.
-    ///
-    /// # Why the coefficients are derived rather than set
+    /// # Why the volumetric pass cannot carry the fog itself
     ///
     /// Bevy computes a fog volume's ambient in-scattering as
-    /// `exp(-ray_length * (absorption + scattering))` -- with no density term.
-    /// At the scale of a weather volume that underflows to zero for any
-    /// ordinary coefficient, leaving the fog purely absorbing: a blizzard comes
-    /// out as a black box hanging in the air rather than a white-out.
+    /// `exp(-ray_length * (absorption + scattering))`, with no density term in
+    /// it. That makes the term shrink with distance: a long ray to the sky
+    /// picks up *less* ambient than a short ray to nearby geometry, which is
+    /// backwards. Turn it up and the horizon develops a dark band with a bright
+    /// foreground beneath it -- the opposite of fog. So the ambient is left at
+    /// zero and the volume contributes only the directional-light term, which
+    /// is computed correctly.
     ///
-    /// So the total extinction coefficient is pinned to `1 / volume_size`,
-    /// which keeps that term alive, and the actual density is carried by
-    /// [`max_optical_depth`](Self::max_optical_depth) instead. The ambient
-    /// intensity is then scaled back up to compensate, and scaled by the fog
-    /// amount so that clear weather adds no glow at all.
-    pub luminance: f32,
+    /// That term is pure absorption on its own, so the volume still dims what
+    /// is behind it. Keeping the optical depth low keeps that dimming below
+    /// the level where it fights the distance fog.
+    pub max_optical_depth: f32,
 
     /// Fraction of the fog's extinction that is absorption rather than
     /// scattering, `0.0..=1.0`. Higher is darker and moodier.
@@ -94,6 +89,16 @@ pub struct FogConfig {
     /// How strongly fog scatters light toward the camera, `-1.0..=1.0`.
     /// High values make god rays snap into view when you face the sun.
     pub scattering_asymmetry: f32,
+
+    /// How much brighter fog is looking toward the sun than away from it.
+    ///
+    /// Fog scatters light forward, so it glows in the sun's direction. Zero
+    /// gives a flat, uniform colour in every direction, which is what makes
+    /// fog look like a grey card rather than like air.
+    pub sun_glow: f32,
+
+    /// How tightly that glow is concentrated around the sun. Higher is tighter.
+    pub sun_glow_exponent: f32,
 
     /// Random offset applied to each ray's start, to trade banding for noise.
     /// Worth raising when temporal antialiasing is on to smooth it back out.
@@ -111,14 +116,15 @@ impl Default for FogConfig {
     fn default() -> Self {
         Self {
             volume_size: 700.0,
-            volume_height: 60.0,
+            volume_height: 30.0,
             volume_offset: -10.0,
-            max_optical_depth: 2.5,
-            luminance: 0.6,
+            max_optical_depth: 0.25,
             absorption_fraction: 0.25,
             day_color: Color::srgb(0.78, 0.82, 0.88),
             night_color: Color::srgb(0.10, 0.13, 0.20),
             scattering_asymmetry: 0.7,
+            sun_glow: 0.9,
+            sun_glow_exponent: 8.0,
             jitter: 0.0,
             min_visibility: 25.0,
             max_visibility: 3_000.0,
@@ -175,13 +181,14 @@ impl FogConfig {
 
     /// Optical depth the fog volume should have, for a given fog density.
     ///
-    /// Derived from the same visibility as [`DistanceFog`] so the two agree,
-    /// and capped by [`max_optical_depth`](Self::max_optical_depth) so that
-    /// very thick fog does not turn the volume into an opaque box with visible
-    /// edges.
+    /// Straight proportionality rather than anything derived from visibility.
+    /// The volumetric pass is only carrying god rays now, so what matters is
+    /// that it is zero in clear weather and stays well below the level where
+    /// its absorption fights the distance fog. Deriving it from visibility
+    /// instead pins it to the cap across almost the entire range -- including
+    /// at zero fog, which leaves a permanent haze on a cloudless day.
     pub fn volume_optical_depth(&self, density: f32) -> f32 {
-        let visibility = self.visibility_at(density).max(1e-3);
-        (3.0 * self.volume_size / visibility).min(self.max_optical_depth.max(0.0))
+        density.clamp(0.0, 1.0) * self.max_optical_depth.max(0.0)
     }
 }
 
@@ -227,21 +234,12 @@ fn configure_cameras(
         let mut entity_commands = commands.entity(entity);
 
         if config.volumetric_fog {
-            // Undo the `exp(-volume_size * extinction)` the fog shader applies
-            // to its ambient term. With the extinction pinned to
-            // `1 / volume_size` that factor is exactly `1/e`, so multiplying by
-            // `e` recovers the intended brightness. Scaling by the fog amount
-            // is what keeps clear weather from picking up a permanent haze,
-            // since Bevy adds this term whether there is any fog or not.
-            let lit = bodies.daylight
-                + (1.0 - bodies.daylight) * 0.06 * (0.3 + 0.7 * bodies.moon_illumination);
-            let ambient_intensity = density * fog.luminance.max(0.0) * lit * core::f32::consts::E;
-
             entity_commands.insert(VolumetricFog {
                 step_count: config.quality.fog_steps(),
                 jitter: fog.jitter,
                 ambient_color: color,
-                ambient_intensity,
+                // See `FogConfig::max_optical_depth` for why this stays at zero.
+                ambient_intensity: 0.0,
             });
         } else {
             entity_commands.remove::<VolumetricFog>();
@@ -359,17 +357,23 @@ mod tests {
     }
 
     #[test]
-    fn volume_optical_depth_is_capped() {
+    fn volume_optical_depth_is_capped_and_vanishes_in_clear_weather() {
         let config = FogConfig::default();
+        let mut previous = -1.0;
         for i in 0..=20 {
             let depth = config.volume_optical_depth(i as f32 / 20.0);
             assert!(
                 depth <= config.max_optical_depth + 1e-6,
                 "depth {depth} exceeded the cap"
             );
-            assert!(depth >= 0.0);
+            assert!(depth > previous, "depth should rise with fog");
+            previous = depth;
         }
-        assert!(config.volume_optical_depth(1.0) > config.volume_optical_depth(0.0));
+        // No fog means no volume at all, or a clear day picks up a haze it
+        // should not have.
+        assert_eq!(config.volume_optical_depth(0.0), 0.0);
+        assert_eq!(config.volume_optical_depth(-1.0), 0.0);
+        assert_eq!(config.volume_optical_depth(5.0), config.max_optical_depth);
     }
 
     #[test]
@@ -413,8 +417,9 @@ mod volume_tests {
 
     #[test]
     fn extinction_across_the_volume_is_one_nepers_worth() {
-        // This is the invariant the ambient compensation relies on: the fog
-        // shader's `exp(-volume_size * extinction)` must come out at `1/e`.
+        // Keeps the volume's own coefficients in a sane range relative to its
+        // size, so the density carried by `max_optical_depth` means what it
+        // says: optical depth across the volume is the density.
         for size in [50.0f32, 250.0, 1_000.0] {
             let config = FogConfig {
                 volume_size: size,

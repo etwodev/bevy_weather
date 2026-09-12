@@ -77,8 +77,17 @@ pub struct PrecipitationConfig {
     /// Length of a raindrop streak at the reference speed, in world units.
     pub rain_length: f32,
     /// Opacity of a single raindrop, `0.0..=1.0`.
+    ///
+    /// Low. Any one drop is almost invisible; rain reads as rain because there
+    /// are thousands of them, not because each is solid. Individual drops are
+    /// further varied in the shader, so that even at full intensity the field
+    /// has faint drops in it rather than being a uniform mesh of lines.
     pub rain_opacity: f32,
     /// Tint of the rain.
+    ///
+    /// Very close to white. A raindrop is a lens, not a pigment: it shows you a
+    /// distorted picture of whatever light is around it. Giving it a colour of
+    /// its own turns a downpour into a wall of coloured streaks.
     pub rain_color: Color,
 
     /// Terminal velocity of snow, in world units per second.
@@ -106,16 +115,16 @@ impl Default for PrecipitationConfig {
             particle_count: None,
             box_size: 60.0,
             rain_fall_speed: 22.0,
-            rain_width: 0.018,
-            rain_length: 0.55,
-            rain_opacity: 0.55,
-            rain_color: Color::srgb(0.72, 0.78, 0.86),
+            rain_width: 0.014,
+            rain_length: 0.32,
+            rain_opacity: 0.22,
+            rain_color: Color::srgb(0.92, 0.94, 0.97),
             snow_fall_speed: 1.6,
             snow_size: 0.055,
             snow_opacity: 0.85,
             snow_flutter: 0.9,
             snow_color: Color::srgb(0.97, 0.98, 1.0),
-            ambient: 0.06,
+            ambient: 0.03,
             seed: 0x5_0F70,
         }
     }

@@ -29,7 +29,8 @@ struct SkyUniform {
 
     // x: cells per cube face. y: brightness. z: twinkle rate. w: point size.
     star_params: vec4<f32>,
-    // x: colour spread. y: density cutoff. z: twinkle depth. w: unused.
+    // x: colour spread. y: density cutoff. z: twinkle depth.
+    // w: magnitude falloff exponent.
     star_params2: vec4<f32>,
 
     // x: brightness. y: noise scale. z: dust strength. w: band tightness.
@@ -63,6 +64,7 @@ struct SkyUniform {
     // rgb: ground-fog colour, already in post-exposure units. a: unused.
     fog_color: vec4<f32>,
     // x: extinction per world unit. y: fog layer height, world units.
+    // z: forward-scattering glow strength. w: glow exponent.
     fog_params: vec4<f32>,
 
     // x: seconds, wrapped. y: planet radius, m. z: world units per metre.
@@ -237,6 +239,7 @@ fn star_field(star_dir: vec3<f32>, horizon_factor: f32) -> vec3<f32> {
     let color_spread = sky.star_params2.x;
     let cutoff = sky.star_params2.y;
     let twinkle_depth = sky.star_params2.z;
+    let magnitude_falloff = max(sky.star_params2.w, 0.1);
 
     let face = cube_face(star_dir);
     let grid = face.xy * density;
@@ -263,9 +266,12 @@ fn star_field(star_dir: vec3<f32>, horizon_factor: f32) -> vec3<f32> {
             let delta = offset - local;
             let distance_squared = dot(delta, delta);
 
-            // A steep power turns a uniform variate into the real magnitude
-            // distribution: a handful of bright stars, a great many faint ones.
-            let magnitude = pow(rnd.y, 5.0);
+            // A power curve turns a uniform variate into something like the
+            // real magnitude distribution: a handful of bright stars and a
+            // great many faint ones. Too steep and every star lands in the
+            // bottom few percent of the range, which renders as uniform grey
+            // speckle -- recognisably noise rather than a sky.
+            let magnitude = pow(rnd.y, magnitude_falloff);
 
             // Scintillation is an atmospheric effect, so it is strongest near
             // the horizon where you look through the most air.
@@ -342,10 +348,13 @@ fn moon(ray: vec3<f32>) -> vec3<f32> {
     let edge = angular_radius * 0.06;
     let disc = smoothstep(cos(angular_radius + edge), cos_radius, cos_angle);
 
-    // The glow persists outside the disc: forward scattering in the air plus
-    // the bloom your eye adds.
+    // A little glow outside the disc, from forward scattering in the air.
+    // Kept tight and faint: a wide halo baked into the sky cannot be occluded
+    // by anything, so it shows through cloud that should have hidden it. Real
+    // glare belongs in the bloom pass, where it is applied to the composited
+    // image and is hidden along with whatever produced it.
     let angle = acos(clamp(cos_angle, -1.0, 1.0));
-    let halo = exp(-angle / (angular_radius * 14.0)) * 0.06;
+    let halo = exp(-angle / (angular_radius * 5.0)) * 0.03;
 
     var result = vec3(0.0);
 
@@ -763,15 +772,29 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
 
         let opacity = 1.0 - clouds.transmittance;
         if opacity > 0.002 {
-            // Aerial perspective, in two halves. Extinction is applied here;
-            // the *inscattering* half comes free from alpha blending, because
-            // the sky showing through a partly transparent cloud is itself
-            // almost entirely inscattered light.
+            // How much the cloud hides is decided by the cloud alone. Folding
+            // the aerial-perspective transmittance into the alpha as well --
+            // which looks like the same thing, and is tempting because it makes
+            // the inscattering fall out of the blend for free -- leaves a solid
+            // overcast deck at about 87% opacity. That is invisible against
+            // blue sky and glaring against the sun, whose disc is some four
+            // orders of magnitude brighter than anything else in the frame: it
+            // burns straight through the storm.
+            cloud_alpha = saturate(opacity);
+
+            // So aerial perspective is applied to the colour instead, both
+            // halves explicitly: the cloud's own light is extinguished by the
+            // air in front of it, and the air in front of it adds its own
+            // inscattered light in turn. That second term is what makes a
+            // distant cloud fade into the haze rather than just going dark.
             let air = aerial_transmittance(altitude, ray.y, clouds.mean_distance);
-            cloud_alpha = saturate(opacity * dot(air, vec3(1.0 / 3.0)));
+            let sun_up = saturate(sky.sun_color.a);
+            let inscattering = sky.sun_color.rgb * SKY_RADIANCE * sun_up;
+            let radiance = clouds.scattering * air + inscattering * (vec3(1.0) - air);
+
             // Un-premultiply: the blend multiplies by alpha again on the way
             // out.
-            cloud_color = clouds.scattering / max(opacity, 1e-4) * view.exposure;
+            cloud_color = radiance / max(opacity, 1e-4) * view.exposure;
         }
     }
 
@@ -786,9 +809,18 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     // at the zenith.
     let fog_extinction = sky.fog_params.x;
     var fog_factor = 0.0;
+    var fog_rgb = sky.fog_color.rgb;
     if fog_extinction > 0.0 {
         let path = sky.fog_params.y / max(ray.y, 0.004);
         fog_factor = 1.0 - exp(-fog_extinction * path);
+
+        // Fog scatters forward, so it is markedly brighter in the direction of
+        // the sun and dimmer away from it. A single flat colour in every
+        // direction is the thing that makes fog read as a grey card taped over
+        // the lens rather than as air you are standing in.
+        let toward_sun = saturate(dot(ray, sky.sun_direction.xyz));
+        let glow = sky.fog_params.z * pow(toward_sun, sky.fog_params.w) * saturate(sky.sun_color.a);
+        fog_rgb = fog_rgb * (1.0 + glow) + sky.sun_color.rgb * glow * 0.35;
     }
 
     // Composite `fog over (cloud over sky)` into the single source colour and
@@ -797,8 +829,7 @@ fn fragment(in: VertexOutput) -> @location(0) vec4<f32> {
     if alpha <= 0.002 {
         discard;
     }
-    let premultiplied =
-        sky.fog_color.rgb * fog_factor + cloud_color * cloud_alpha * (1.0 - fog_factor);
+    let premultiplied = fog_rgb * fog_factor + cloud_color * cloud_alpha * (1.0 - fog_factor);
 
     return vec4(premultiplied / alpha, alpha);
 #else
