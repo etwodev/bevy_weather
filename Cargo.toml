@@ -9,7 +9,10 @@ repository = "https://github.com/etwodev/bevy_weather"
 readme = "README.md"
 keywords = ["bevy", "weather", "sky", "clouds", "gamedev"]
 categories = ["game-development", "rendering"]
-exclude = ["/.github", "/assets"]
+# `.cargo/config.toml` only points the Windows cross-compile at the mingw
+# linker, which is nobody's business but this repository's. Cargo ignores a
+# dependency's config anyway; this just keeps it out of the published source.
+exclude = ["/.github", "/assets", "/.cargo"]
 
 [features]
 default = ["audio"]

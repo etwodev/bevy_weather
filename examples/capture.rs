@@ -122,34 +122,6 @@ fn shots() -> Vec<Shot> {
             .collect();
     }
 
-    if std::env::var("LENS").is_ok() {
-        // The lens effect, at a few rain intensities and times of day. Bright
-        // scenes behind the glass are the interesting case, since that is where
-        // the refraction has something to show.
-        return vec![
-            shot("lens-rain-day", 11.0, WeatherPreset::Rain, fixed(0.35, 4.0)),
-            shot(
-                "lens-storm-day",
-                11.0,
-                WeatherPreset::Storm,
-                fixed(0.35, 4.0),
-            ),
-            shot(
-                "lens-thunderstorm",
-                15.0,
-                WeatherPreset::Thunderstorm,
-                fixed(0.35, 2.0),
-            ),
-            shot(
-                "lens-drizzle",
-                11.0,
-                WeatherPreset::Drizzle,
-                fixed(0.35, 4.0),
-            ),
-            shot("lens-clear", 11.0, WeatherPreset::Clear, fixed(0.35, 4.0)),
-        ];
-    }
-
     if let Ok(which) = std::env::var("DUSK") {
         // Fine steps across twilight, looking well up and away from the sun --
         // the part of the sky where the stars have to arrive smoothly as the
@@ -498,7 +470,6 @@ fn setup(
     mut meteors: ResMut<MeteorConfig>,
     mut cloud_shadows: ResMut<CloudShadowConfig>,
     mut moon_light: ResMut<MoonLightConfig>,
-    mut rain_lens: ResMut<RainLensConfig>,
     mut galaxy: ResMut<GalaxyConfig>,
     mut clouds: ResMut<bevy_weather::clouds::CloudConfig>,
     mut config: ResMut<WeatherConfig>,
@@ -519,15 +490,6 @@ fn setup(
     }
     if let Ok(v) = std::env::var("SHADOWTILE") {
         cloud_shadows.tile_size = v.parse().unwrap_or(4_000.0);
-    }
-    if std::env::var("LENS").is_ok() {
-        // The capture only runs half a second of simulated time per shot, so
-        // the lens has to wet much faster than it would in play.
-        rain_lens.wet_seconds = 0.05;
-        rain_lens.dry_seconds = 0.05;
-    }
-    if std::env::var("NO_LENS").is_ok() {
-        rain_lens.enabled = false;
     }
     if std::env::var("NO_MOON_SHADOWS").is_ok() {
         moon_light.shadows = false;

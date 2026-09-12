@@ -1,0 +1,117 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fewer, larger codegen units and no incremental state: CI builds once and
+  # throws the machine away, so the incremental bookkeeping is pure cost.
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            libasound2-dev libudev-dev libwayland-dev libxkbcommon-dev
+      # `--all-targets` builds the examples as well as the tests, which is the
+      # only thing that catches a showcase or capture harness left behind by a
+      # change to the library.
+      - run: cargo test --locked --all-targets
+      - run: cargo test --locked --doc
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            libasound2-dev libudev-dev libwayland-dev libxkbcommon-dev
+      - run: cargo fmt --all --check
+      # `-D warnings` after the `--` applies to this crate only, so a warning
+      # in a dependency cannot fail the build.
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      # The one combination `--all-features` cannot reach: no audio.
+      - run: cargo check --locked --no-default-features
+
+  docs:
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            libasound2-dev libudev-dev libwayland-dev libxkbcommon-dev
+      - run: cargo doc --locked --no-deps
+
+  msrv:
+    name: minimum supported Rust (from Cargo.toml)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Read rust-version
+        id: msrv
+        run: |
+          version=$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            libasound2-dev libudev-dev libwayland-dev libxkbcommon-dev
+      # An MSRV nobody checks is decoration. If this fails, either something
+      # here needs a newer compiler or `rust-version` needs raising -- both are
+      # worth knowing before someone on that compiler finds out for you.
+      - run: cargo check --locked --all-targets
+
+  package:
+    name: crates.io dry run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            libasound2-dev libudev-dev libwayland-dev libxkbcommon-dev
+      # Packaging fails for reasons ordinary builds never surface: metadata
+      # crates.io insists on, a file the `exclude` list quietly dropped, a path
+      # dependency that cannot be published. Finding that out on the tag, after
+      # the version is already cut, is the worst time to find it out.
+      - run: cargo publish --locked --dry-run

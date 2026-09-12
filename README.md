@@ -6,6 +6,11 @@ Day/night cycle, procedural stars, a Milky Way, moon phases, volumetric clouds,
 volumetric fog, rain, snow, thunder — and a procedural driver that generates all
 of it from nothing but the clock.
 
+```toml
+[dependencies]
+bevy_weather = "0.1"
+```
+
 ```rust,no_run
 use bevy::prelude::*;
 use bevy_weather::prelude::*;
@@ -44,7 +49,6 @@ the stars come out.
 | **Cloud shadows** | The deck's own shape, projected onto the ground along the sun as a light cookie, drifting with the same wind. |
 | **Volumetric fog** | Bevy's fog volumes and god rays, driven by weather and time of day. |
 | **Rain and snow** | GPU-resident particle fields. One draw call each, tens of thousands of particles, world-anchored. |
-| **Rain on the lens** | A screen-space post pass: droplets cling to the glass, run down it, leave broken trails and refract what is behind them. |
 | **Thunder** | Poisson-scheduled strikes with multi-stroke flash envelopes, scene lighting, in-cloud glow and speed-of-sound thunder delay. |
 | **Procedural weather** | Climate-driven, and a pure function of the clock. |
 
@@ -179,7 +183,6 @@ Every subsystem has its own resource, all mutable at runtime:
 | `CloudShadowConfig` | Ground shadows cast by the cloud deck |
 | `FogConfig` | Fog colour, visibility range and volume size |
 | `PrecipitationConfig` | Particle counts, sizes, speeds |
-| `RainLensConfig` | Water on the camera lens |
 | `MoonLightConfig` | Moonlight brightness, colour and shadows |
 | `ThunderConfig` | Strike rate, distance, flash |
 
@@ -289,6 +292,30 @@ Everything the shaders emit is in physical radiance and is multiplied by
   render-to-texture camera that must not see it, put the sky entities on their
   own render layer.
 
+## Releasing
+
+Publishing is driven from a tag. Set the version, commit, tag and push:
+
+```bash
+cargo set-version 0.2.0        # or edit Cargo.toml by hand
+cargo update -p bevy_weather   # keep Cargo.lock in step
+git commit -am "release 0.2.0"
+git tag v0.2.0
+git push && git push --tags
+```
+
+`.github/workflows/release.yml` then checks that the tag and the manifest agree,
+runs the tests once more, and publishes. It needs a repository secret called
+`CARGO_REGISTRY_TOKEN`, from [crates.io/settings/tokens]; scope it to this crate
+and to publish only. Run the workflow by hand first with `dry_run` left on if
+you want to rehearse it.
+
+Every push also runs `cargo publish --dry-run`, because packaging fails for
+reasons an ordinary build never surfaces — missing metadata, a file the
+`exclude` list quietly dropped — and a tag is the worst moment to find out.
+
+[crates.io/settings/tokens]: https://crates.io/settings/tokens
+
 ## Feature flags
 
 * `audio` *(default)* — pulls in `bevy_audio` so the plugin can play a thunder
@@ -305,7 +332,7 @@ An interactive tour: fly around with `WASD` and the mouse, scrub the clock,
 cycle presets and climates, and toggle each subsystem. The on-screen panel lists
 the keys and shows the live weather state. `8` turns the meteor rate up to a
 shower, since at the honest rate you could watch for a long time without seeing
-one, and `9` toggles rain on the lens.
+one.
 
 ### Building for Windows from macOS or Linux
 
@@ -397,7 +424,6 @@ In rough order of leverage:
 | `AtmosphereConfig::environment_map_size` | Regenerated every frame; 512 buys nothing over 128 for ambient light. |
 | `CloudShadowConfig::resolution` | The shadow texture is rebuilt on the CPU: about 1.5 ms at 64, 6 ms at 128, 20 ms at 256, spread across the frames of `update_seconds` rather than landing on one. |
 | `CloudShadowConfig::enabled` | Off is free. |
-| `RainLensConfig::enabled` | A full-screen pass whenever the lens is wet; off costs nothing, and a dry lens does no render work at all. |
 | `MoonLightConfig::shadows` | A second set of cascaded shadow maps, rendered only while the moon is actually contributing. |
 | `PrecipitationConfig::particle_count` | Fill-rate bound, so it also scales with `box_size`. |
 

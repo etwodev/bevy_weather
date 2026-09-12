@@ -11,7 +11,6 @@ pub mod math;
 pub mod precipitation;
 pub mod presets;
 pub mod procedural;
-pub mod rain_lens;
 pub mod sky;
 pub mod state;
 pub mod thunder;
@@ -33,7 +32,6 @@ pub mod prelude {
     pub use crate::precipitation::PrecipitationConfig;
     pub use crate::presets::WeatherPreset;
     pub use crate::procedural::{Climate, ProceduralWeather};
-    pub use crate::rain_lens::{LensWetness, RainLens, RainLensConfig};
     pub use crate::sky::{GalaxyConfig, MeteorConfig, MoonConfig, StarConfig};
     pub use crate::state::{Weather, WeatherConditions};
     pub use crate::thunder::{LightningStrike, ThunderConfig};
@@ -107,7 +105,6 @@ impl Plugin for WeatherPlugin {
             cloud_shadows::CloudShadowPlugin,
             fog::WeatherFogPlugin,
             precipitation::PrecipitationPlugin,
-            rain_lens::RainLensPlugin,
             thunder::ThunderPlugin,
         ));
     }
@@ -141,7 +138,6 @@ impl PluginGroup for WeatherPlugins {
             .add(cloud_shadows::CloudShadowPlugin)
             .add(fog::WeatherFogPlugin)
             .add(precipitation::PrecipitationPlugin)
-            .add(rain_lens::RainLensPlugin)
             .add(thunder::ThunderPlugin)
     }
 }
