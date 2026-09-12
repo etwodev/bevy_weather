@@ -112,8 +112,12 @@ pub struct FogConfig {
     /// Worth raising when temporal antialiasing is on to smooth it back out.
     pub jitter: f32,
 
-    /// Visibility in world units at [`max_density`](Self::max_density), used
-    /// for [`DistanceFog`].
+    /// Visibility in world units in the thickest fog, used for
+    /// [`DistanceFog`].
+    ///
+    /// This is the value at a fog density of `1.0`; see
+    /// [`visibility_at`](Self::visibility_at) for how the range between this
+    /// and [`max_visibility`](Self::max_visibility) is walked.
     pub min_visibility: f32,
 
     /// Visibility in world units with no fog at all.
@@ -156,8 +160,13 @@ impl FogConfig {
 
     /// Total extinction coefficient handed to Bevy's fog volume.
     ///
-    /// Pinned to the reciprocal of the volume size; see
-    /// [`luminance`](Self::luminance) for why.
+    /// Pinned to the reciprocal of [`volume_size`](Self::volume_size), which is
+    /// what lets [`volume_optical_depth`](Self::volume_optical_depth) mean
+    /// something absolute. Bevy multiplies this coefficient by the volume's
+    /// density factor, so a ray crossing the whole volume accumulates exactly
+    /// that factor's worth of optical depth however large the box happens to
+    /// be. Choose the extinction independently and the two are coupled: resize
+    /// the volume and the fog inside it silently changes strength.
     pub fn volume_extinction(&self) -> f32 {
         1.0 / self.volume_size.max(1.0)
     }

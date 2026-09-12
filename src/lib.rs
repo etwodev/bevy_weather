@@ -112,7 +112,8 @@ impl Plugin for WeatherPlugin {
 
 /// [`WeatherPlugin`] as a [`PluginGroup`], for symmetry with `DefaultPlugins`.
 ///
-/// Lets you disable a subsystem without touching [`WeatherConfig`]:
+/// Lets you disable a subsystem without touching
+/// [`WeatherConfig`](config::WeatherConfig):
 ///
 /// ```no_run
 /// # use bevy::prelude::*;
